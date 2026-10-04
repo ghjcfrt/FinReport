@@ -1,0 +1,12 @@
+[project]
+name = "finreport-worker-host"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["finance-domain", "finance-application", "finance-adapters", "celery>=5.4.0"]
+
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/finreport_worker"]

@@ -1,0 +1,49 @@
+# Python caches and build artifacts
+__pycache__/
+*.py[cod]
+*.pyd
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Python virtual environments and local configuration
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# Python/package build output
+build/
+dist/
+dist-test/
+wheels/
+
+# .NET build output and user-specific files
+bin/
+obj/
+*.user
+*.suo
+
+# Rust build output
+target/
+
+# Local data, generated documents, and temporary files
+data/
+word/
+tmp/
+tmp_*/
+tests/**/.runtime/
+
+# IDE, OS, and tool metadata
+.history/
+.idea/
+.vscode/
+.vs/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,1 @@
+"""Evidence-bound analysis contracts."""

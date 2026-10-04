@@ -1,0 +1,42 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "apps", "apps", "{1787FE1D-075E-9E68-7218-25F1BD1BBEAB}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "desktop", "desktop", "{BEEBFA7C-7F97-CB0F-CEE6-EE38567484E9}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FinReport.Desktop", "apps\desktop\FinReport.Desktop\FinReport.Desktop.csproj", "{3101A8D3-6A74-4773-B1C2-37726D06E151}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Debug|x64 = Debug|x64
+		Debug|x86 = Debug|x86
+		Release|Any CPU = Release|Any CPU
+		Release|x64 = Release|x64
+		Release|x86 = Release|x86
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{3101A8D3-6A74-4773-B1C2-37726D06E151}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{3101A8D3-6A74-4773-B1C2-37726D06E151}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{3101A8D3-6A74-4773-B1C2-37726D06E151}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{3101A8D3-6A74-4773-B1C2-37726D06E151}.Debug|x64.Build.0 = Debug|Any CPU
+		{3101A8D3-6A74-4773-B1C2-37726D06E151}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{3101A8D3-6A74-4773-B1C2-37726D06E151}.Debug|x86.Build.0 = Debug|Any CPU
+		{3101A8D3-6A74-4773-B1C2-37726D06E151}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{3101A8D3-6A74-4773-B1C2-37726D06E151}.Release|Any CPU.Build.0 = Release|Any CPU
+		{3101A8D3-6A74-4773-B1C2-37726D06E151}.Release|x64.ActiveCfg = Release|Any CPU
+		{3101A8D3-6A74-4773-B1C2-37726D06E151}.Release|x64.Build.0 = Release|Any CPU
+		{3101A8D3-6A74-4773-B1C2-37726D06E151}.Release|x86.ActiveCfg = Release|Any CPU
+		{3101A8D3-6A74-4773-B1C2-37726D06E151}.Release|x86.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{BEEBFA7C-7F97-CB0F-CEE6-EE38567484E9} = {1787FE1D-075E-9E68-7218-25F1BD1BBEAB}
+		{3101A8D3-6A74-4773-B1C2-37726D06E151} = {BEEBFA7C-7F97-CB0F-CEE6-EE38567484E9}
+	EndGlobalSection
+EndGlobal
