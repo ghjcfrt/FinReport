@@ -5,23 +5,93 @@ import json
 from decimal import Decimal
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, object_session
 
-from finance_adapters.persistence.models import Company, FilingVersion, FinancialFact, MetricResult
+from finance_adapters.persistence.models import (
+    Company,
+    EvidenceFragment,
+    FactDimension,
+    FilingVersion,
+    FinancialFact,
+    MetricResult,
+    ValidationResult,
+)
 
 FORMULA_VERSION = "general-non-financial-v1"
 
 
+def require_supported_period(filing: FilingVersion) -> None:
+    if (filing.scope != "consolidated" or filing.period_basis != "annual"
+            or filing.report_type != "annual"
+            or filing.period_start.year != filing.period_end.year
+            or (filing.period_start.month, filing.period_start.day) != (1, 1)
+            or (filing.period_end.month, filing.period_end.day) != (12, 31)):
+        raise ValueError("UNSUPPORTED_STRICT_FILING_SCOPE_OR_PERIOD")
+
+
+def require_source_assurance(session: Session, filing: FilingVersion) -> None:
+    require_supported_period(filing)
+    validations = list(session.scalars(select(ValidationResult).where(
+        ValidationResult.filing_version_id == filing.id,
+    )))
+    if any(v.severity == "fatal" and v.status != "passed" for v in validations):
+        raise ValueError("STRICT_VALIDATIONS_FAILED")
+    passed = {v.rule_code for v in validations if v.status == "passed"}
+    if not {"source_sha256", "audit_opinion"}.issubset(passed):
+        raise ValueError("STRICT_SOURCE_AND_AUDIT_REQUIRED")
+
+
+def current_verified_facts(session: Session, filing: FilingVersion) -> dict[str, FinancialFact]:
+    require_supported_period(filing)
+    facts: dict[str, FinancialFact] = {}
+    for fact in session.scalars(select(FinancialFact).where(
+        FinancialFact.filing_version_id == filing.id,
+        FinancialFact.review_status != "superseded",
+        FinancialFact.quality_status == "facts_verified",
+        FinancialFact.review_status == "verified",
+        FinancialFact.comparative_period.is_(False),
+        FinancialFact.is_restatement.is_(False),
+        FinancialFact.period_start == filing.period_start,
+        FinancialFact.period_end == filing.period_end,
+    ).order_by(FinancialFact.id)):
+        scopes = list(session.scalars(select(FactDimension.dimension_value).where(
+            FactDimension.fact_id == fact.id, FactDimension.dimension_name == "scope",
+        )))
+        if not scopes or any(scope != filing.scope for scope in scopes):
+            raise ValueError("FACT_SCOPE_MISMATCH")
+        if fact.concept_code in facts:
+            raise ValueError("AMBIGUOUS_CURRENT_FACT")
+        if fact.assurance_level != "audited_annual":
+            raise ValueError("STRICT_AUDIT_ASSURANCE_REQUIRED")
+        if not Decimal(fact.value).is_finite() or fact.unit_scale <= 0 or fact.currency != "CNY":
+            raise ValueError("FACT_UNIT_OR_VALUE_INVALID")
+        facts[fact.concept_code] = fact
+    return facts
+
+
 def _snapshot(facts: dict[str, FinancialFact]) -> str:
-    value = [
-        {
+    value = []
+    for fact in sorted(facts.values(), key=lambda item: (item.concept_code, item.id)):
+        session = object_session(fact)
+        evidence = list(session.scalars(select(EvidenceFragment).where(
+            EvidenceFragment.fact_id == fact.id,
+        ).order_by(EvidenceFragment.id))) if session else []
+        dimensions = list(session.scalars(select(FactDimension).where(
+            FactDimension.fact_id == fact.id,
+        ).order_by(FactDimension.dimension_name, FactDimension.dimension_value))) if session else []
+        value.append({
             "id": fact.id,
             "code": fact.concept_code,
-            "value": str(fact.value),
+            "value": str(Decimal(fact.value).quantize(Decimal("0.0001"))),
             "revision": fact.revision_no,
-        }
-        for fact in facts.values()
-    ]
+            "currency": fact.currency, "unit_scale": fact.unit_scale,
+            "period_start": str(fact.period_start), "period_end": str(fact.period_end),
+            "statement_type": fact.statement_type,
+            "dimensions": [[d.dimension_name, d.dimension_value] for d in dimensions],
+            "evidence": [{"id": e.id, "page": e.page_no, "sha256": e.page_sha256,
+                          "row": e.row_locator, "column": e.column_locator,
+                          "bbox": e.bounding_box, "raw_value": e.raw_value} for e in evidence],
+        })
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
@@ -74,19 +144,12 @@ def _result(
 
 def calculate_metrics(session: Session, filing_id: int) -> list[MetricResult]:
     filing = session.get(FilingVersion, filing_id)
-    if filing is None or filing.status != "facts_verified":
+    if filing is None or filing.status not in {"facts_verified", "metrics_ready", "analysis_ready"}:
         raise ValueError("STRICT_FACTS_REQUIRED")
-    if filing.scope not in {"consolidated", "parent"} or filing.period_basis not in {"annual", "semi_annual"}:
-        raise ValueError("UNSUPPORTED_FILING_SCOPE_OR_PERIOD")
-    facts = {
-        fact.concept_code: fact
-        for fact in session.scalars(
-            select(FinancialFact).where(
-                FinancialFact.filing_version_id == filing_id,
-                FinancialFact.quality_status == "facts_verified",
-            )
-        )
-    }
+    require_source_assurance(session, filing)
+    facts = current_verified_facts(session, filing)
+    if not facts:
+        raise ValueError("STRICT_FACTS_REQUIRED")
     company = session.get(Company, filing.company_id)
     financial_industries = {"bank", "insurance", "broker", "finance", "J66", "J67", "J68"}
     is_financial = bool(company and (company.industry_code in financial_industries or company.industry_code.lower() in financial_industries))

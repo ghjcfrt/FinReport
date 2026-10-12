@@ -3,6 +3,32 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+
+def _load_environment() -> None:
+    # Resolve from the source checkout, so launchers and arbitrary working
+    # directories share one configuration. Explicit process values take priority.
+    configured = os.getenv("FINREPORT_ENV_FILE")
+    if configured:
+        load_dotenv(Path(configured), override=False)
+        return
+    for root in Path(__file__).resolve().parents:
+        if (root / "apps").is_dir() and (root / "packages").is_dir():
+            load_dotenv(root / ".env", override=False)
+            return
+
+
+_load_environment()
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Read a boolean environment variable using explicit, human-friendly values."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
 
 class Settings:
     database_url = os.getenv("FINREPORT_DATABASE_URL", "sqlite:///./data/finreport.db")
@@ -29,10 +55,36 @@ class Settings:
     av_scanner_executable = os.getenv("FINREPORT_AV_SCANNER_EXECUTABLE")
     av_scan_timeout_seconds = float(os.getenv("FINREPORT_AV_SCAN_TIMEOUT_SECONDS", "60"))
     av_mode = os.getenv("FINREPORT_AV_MODE", "supervisor")
+    # Mock scanning is test-only and must be explicitly enabled.  Keeping this
+    # disabled by default prevents a deployment from silently promoting an
+    # upload without an antivirus result when AV mode is misconfigured.
+    allow_mock_scanner = _env_bool("FINREPORT_ALLOW_MOCK_SCANNER", False)
     av_native_probe_executable = os.getenv("FINREPORT_AV_NATIVE_PROBE_EXECUTABLE")
     av_native_shim = os.getenv("FINREPORT_AV_NATIVE_SHIM")
     av_native_database = os.getenv("FINREPORT_AV_NATIVE_DATABASE")
     av_native_certs = os.getenv("FINREPORT_AV_NATIVE_CERTS")
+    # Virus-database updates are opt-in. The updater always stages a new
+    # immutable version and requires official signatures plus a native probe
+    # before swapping current.json.
+    av_update_enabled = _env_bool("FINREPORT_AV_UPDATE_ENABLED", False)
+    av_update_script = os.getenv("FINREPORT_AV_UPDATE_SCRIPT")
+    av_update_freshclam = os.getenv("FINREPORT_AV_UPDATE_FRESHCLAM")
+    av_update_config = os.getenv("FINREPORT_AV_UPDATE_CONFIG")
+    av_update_sigtool = os.getenv("FINREPORT_AV_UPDATE_SIGTOOL")
+    av_update_signature_certs = os.getenv("FINREPORT_AV_UPDATE_SIGNATURE_CERTS")
+    av_update_probe_executable = os.getenv("FINREPORT_AV_UPDATE_PROBE_EXECUTABLE")
+    av_update_probe_file = os.getenv("FINREPORT_AV_UPDATE_PROBE_FILE")
+    av_update_timeout_seconds = float(os.getenv("FINREPORT_AV_UPDATE_TIMEOUT_SECONDS", "900"))
+    # The production Scanner Supervisor listens on a Windows named pipe.  Keep
+    # the protocol settings in configuration so the API process never needs to
+    # know how the Supervisor is hosted.
+    av_supervisor_pipe = os.getenv("FINREPORT_SCANNER_PIPE", r"\\.\pipe\FinReport.Scanner.v1")
+    av_supervisor_poll_interval_seconds = float(
+        os.getenv("FINREPORT_SCANNER_POLL_INTERVAL_SECONDS", "0.10")
+    )
+    av_supervisor_connect_timeout_seconds = float(
+        os.getenv("FINREPORT_SCANNER_CONNECT_TIMEOUT_SECONDS", "2")
+    )
 
     def update_model(self, stage: str, *, provider: str, base_url: str, api_key: str, model: str) -> None:
         if stage == "analysis":

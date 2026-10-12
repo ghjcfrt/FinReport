@@ -21,6 +21,40 @@
         }
       }
     },
+    "/api/v1/security/scanner": {
+      "get": {
+        "summary": "Scanner Status",
+        "description": "Expose scanner/database readiness without exposing local paths or secrets.",
+        "operationId": "scanner_status_api_v1_security_scanner_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/security/scanner/update": {
+      "post": {
+        "summary": "Update Scanner Database",
+        "description": "Queue one controlled official ClamAV database update.\n\nThe operation is asynchronous. The updater stages and validates a candidate\nbefore pointer activation; the Supervisor then validates and loads it. A\nrunning update is rejected to avoid competing freshclam writers.",
+        "operationId": "update_scanner_database_api_v1_security_scanner_update_post",
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/settings/models": {
       "get": {
         "summary": "Model Settings",
@@ -348,6 +382,43 @@
                 }
               ],
               "title": "Quality Status"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/filings/{filing_version_id}/validations": {
+      "get": {
+        "summary": "List Validations",
+        "operationId": "list_validations_api_v1_filings__filing_version_id__validations_get",
+        "parameters": [
+          {
+            "name": "filing_version_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Filing Version Id"
             }
           }
         ],

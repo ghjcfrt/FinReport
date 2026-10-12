@@ -27,6 +27,27 @@ class ModelClient:
     def __init__(self, config: ModelConfig):
         self.config = config
 
+    def _response(self, data: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        if self.config.provider == "anthropic":
+            finish = data.get("stop_reason")
+            content = "".join(item.get("text", "") for item in data.get("content", []))
+        else:
+            choices = data.get("choices", [])
+            if not choices:
+                raise ValueError("MODEL_EMPTY_RESPONSE")
+            finish = choices[0].get("finish_reason")
+            content = choices[0].get("message", {}).get("content")
+        if finish in {"length", "max_tokens"}:
+            raise ValueError("MODEL_OUTPUT_TRUNCATED")
+        if finish in {"content_filter", "refusal"}:
+            raise ValueError("MODEL_OUTPUT_BLOCKED")
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("MODEL_EMPTY_RESPONSE")
+        return content, {
+            "id": data.get("id"), "model": data.get("model", self.config.model),
+            "finish_reason": finish,
+        }
+
     def complete(self, *, system: str, user: str, response_json: bool = False) -> tuple[str, dict[str, Any]]:
         if self.config.provider == "anthropic":
             payload: dict[str, Any] = {
@@ -57,11 +78,7 @@ class ModelClient:
             response = client.post(url, headers=headers, json=payload)
             response.raise_for_status()
         data = response.json()
-        if self.config.provider == "anthropic":
-            content = data["content"][0]["text"]
-        else:
-            content = data["choices"][0]["message"]["content"]
-        return content, {"id": data.get("id"), "model": data.get("model", self.config.model)}
+        return self._response(data)
 
     def vision(self, *, system: str, prompt: str, image: bytes, media_type: str = "image/png") -> tuple[str, dict[str, Any]]:
         encoded = base64.b64encode(image).decode("ascii")
@@ -81,21 +98,37 @@ class ModelClient:
             headers = {"x-api-key": self.config.api_key, "anthropic-version": "2023-06-01"}
             url = self.config.base_url.rstrip("/") + "/messages"
         else:
-            payload = {
-                "model": self.config.model,
-                "messages": [{"role": "system", "content": system}, {"role": "user", "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{encoded}"}},
-                ]}],
+            image_part = {
+                "type": "image_url",
+                "image_url": {"url": f"data:{media_type};base64,{encoded}"},
             }
+            if "deepseek-ocr" in self.config.model.lower():
+                # DeepSeek-OCR uses its document prompt without a system role,
+                # and expects the image before the prompt (official examples).
+                payload = {
+                    "model": self.config.model,
+                    "messages": [{"role": "user", "content": [
+                        image_part,
+                        {"type": "text", "text": "<image>\n<|grounding|>Convert the document to markdown."},
+                    ]}],
+                    "temperature": 0, "max_tokens": 4096, "stream": False,
+                }
+            else:
+                payload = {
+                    "model": self.config.model,
+                    "messages": [{"role": "system", "content": system}, {
+                        "role": "user", "content": [
+                            {"type": "text", "text": prompt}, image_part,
+                        ],
+                    }],
+                }
             headers = {"Authorization": f"Bearer {self.config.api_key}"}
             url = self.config.base_url.rstrip("/") + "/chat/completions"
         with httpx.Client(timeout=self.config.timeout) as client:
             response = client.post(url, headers=headers, json=payload)
             response.raise_for_status()
         data = response.json()
-        content = data["content"][0]["text"] if self.config.provider == "anthropic" else data["choices"][0]["message"]["content"]
-        return content, {"id": data.get("id"), "model": data.get("model", self.config.model)}
+        return self._response(data)
 
 
 def json_text(value: object) -> str:

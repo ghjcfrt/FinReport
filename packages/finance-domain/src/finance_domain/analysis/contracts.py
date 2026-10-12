@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from datetime import date
 from decimal import Decimal
-from typing import Any, Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ReviewRequest(BaseModel):
@@ -17,8 +18,33 @@ class MetricRequest(BaseModel):
     strict: bool = True
 
 
+class MetricObservation(BaseModel):
+    """Model-selected metric facts; numerical prose is rendered by the server."""
+
+    model_config = ConfigDict(extra="forbid")
+    metric_result_id: int
+    value: Decimal = Field(allow_inf_nan=False)
+    unit: Literal["currency", "ratio"]
+    scope: Literal["consolidated", "parent"]
+    period_start: date
+    period_end: date
+    input_fact_ids: list[int]
+
+
+class AnalysisScope(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    period_start: date
+    period_end: date
+    scope: Literal["consolidated", "parent"]
+    period_basis: Literal["annual", "semi_annual"]
+    currency: str
+
+
 class Claim(BaseModel):
-    type: str
+    model_config = ConfigDict(extra="forbid")
+
+    type: str = Field(min_length=1, max_length=64)
     claim_class: Literal[
         "fact_restatement",
         "calculated_observation",
@@ -32,14 +58,19 @@ class Claim(BaseModel):
     evidence_fragment_ids: list[int]
     evidence_relation: Literal["direct", "inferred"]
     review_required: bool
+    observations: list[MetricObservation] = Field(default_factory=list)
 
 
 class AnalysisOutput(BaseModel):
-    analysis_scope: dict[str, Any]
+    model_config = ConfigDict(extra="forbid")
+
+    analysis_scope: AnalysisScope
     overall_conclusion: str
+    qualitative_summary: str
+    overall_review_required: Literal[True]
     claims: list[Claim]
     limitations: list[str]
-    report_sections: list[str]
+    report_sections: list[Annotated[str, Field(min_length=1)]] = Field(min_length=1)
 
 
 class ComparisonRequest(BaseModel):

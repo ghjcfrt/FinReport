@@ -268,6 +268,7 @@ dependencies = [
     { name = "finance-domain" },
     { name = "httpx" },
     { name = "pymupdf" },
+    { name = "python-dotenv" },
     { name = "sqlalchemy" },
 ]
 
@@ -278,6 +279,7 @@ requires-dist = [
     { name = "finance-domain", editable = "packages/finance-domain" },
     { name = "httpx", specifier = ">=0.28.0" },
     { name = "pymupdf", specifier = ">=1.25.0" },
+    { name = "python-dotenv", specifier = ">=1.0.1" },
     { name = "sqlalchemy", specifier = ">=2.0.36" },
 ]
 

@@ -35,16 +35,19 @@ from finance_adapters.persistence.models import (
     ComparisonRun,
     EvidenceFragment,
     ExtractionJob,
+    FactDimension,
     FactReview,
     FileScan,
     FilingVersion,
     FinancialFact,
     MetricResult,
     PeerUniverse,
+    ValidationResult,
 )
 from finance_adapters.persistence.review_gateway import recompute_filing_quality
 from finance_adapters.providers.llm_analysis import build_evidence_package, run_analysis
-from finance_adapters.security import ScanDisposition, scanner
+from finance_adapters.security import ScanDisposition, database_update, scanner
+from finance_adapters.security.file_gate import scanned_object_path
 from finance_application.workflows.runtime import WorkflowRuntime
 from finance_domain.analysis.contracts import (
     ComparisonRequest,
@@ -110,6 +113,29 @@ def get_filing(session: Session, filing_id: int) -> FilingVersion:
 @app.get("/health")
 def health(request: Request):
     return envelope(request, {"status": "ok"})
+
+
+@app.get("/api/v1/security/scanner")
+def scanner_status(request: Request):
+    """Expose scanner/database readiness without exposing local paths or secrets."""
+    return envelope(request, database_update.get_status())
+
+
+@app.post("/api/v1/security/scanner/update", status_code=202)
+async def update_scanner_database(request: Request):
+    """Queue one controlled official ClamAV database update.
+
+    The operation is asynchronous. The updater stages and validates a candidate
+    before pointer activation; the Supervisor then validates and loads it. A
+    running update is rejected to avoid competing freshclam writers.
+    """
+    try:
+        result = await database_update.start_update()
+    except RuntimeError as exc:
+        code = str(exc)
+        status = 409 if code == "AV_UPDATE_ALREADY_RUNNING" else 503
+        raise HTTPException(status, code) from exc
+    return envelope(request, result)
 
 
 @app.get("/api/v1/settings/models")
@@ -181,6 +207,22 @@ async def upload_filing(
     source_priority: int = Form(3, ge=1, le=3),
     session: Session = Depends(get_session),
 ):
+    if period_start > period_end or report_type != period_basis:
+        raise HTTPException(422, "REPORTING_PERIOD_INVALID")
+    if period_basis not in {"annual", "semi_annual", "quarterly"}:
+        raise HTTPException(422, "REPORTING_PERIOD_UNSUPPORTED")
+    if period_basis == "annual" and (
+        period_start.year != period_end.year
+        or (period_start.month, period_start.day) != (1, 1)
+        or (period_end.month, period_end.day) != (12, 31)
+    ):
+        raise HTTPException(422, "ANNUAL_PERIOD_MUST_COVER_FULL_YEAR")
+    if period_basis == "semi_annual" and (
+        period_start.year != period_end.year
+        or (period_start.month, period_start.day) != (1, 1)
+        or (period_end.month, period_end.day) != (6, 30)
+    ):
+        raise HTTPException(422, "SEMI_ANNUAL_PERIOD_INVALID")
     if (
         not file.filename
         or not file.filename.lower().endswith(".pdf")
@@ -214,6 +256,11 @@ async def upload_filing(
     object_key = str(settings.storage_dir / "objects" / sha256[:2] / f"{sha256}.pdf")
     duplicate = session.scalar(select(FilingVersion).where(FilingVersion.file_sha256 == sha256))
     if duplicate:
+        existing_company = session.get(Company, duplicate.company_id)
+        if (existing_company.stock_code != stock_code
+                or duplicate.period_start != period_start or duplicate.period_end != period_end
+                or duplicate.report_type != report_type or duplicate.period_basis != period_basis):
+            raise HTTPException(409, "DUPLICATE_FILE_METADATA_MISMATCH")
         return envelope(
             request,
             {"filing_version_id": duplicate.id, "status": duplicate.status, "deduplicated": True},
@@ -284,6 +331,10 @@ def create_job(
     session: Session = Depends(get_session),
 ):
     filing = get_filing(session, filing_version_id)
+    try:
+        scanned_object_path(session, filing)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
     existing = session.scalar(
         select(ExtractionJob)
         .where(
@@ -355,8 +406,12 @@ def retry_job(request: Request, job_id: int, background: BackgroundTasks, sessio
     job = session.get(ExtractionJob, job_id)
     if job is None:
         raise HTTPException(404, "JOB_NOT_FOUND")
-    if job.status not in {"failed", "needs_review"}:
+    if job.status != "failed" and not (job.status == "completed" and job.stage == "needs_review"):
         raise HTTPException(409, "JOB_NOT_RETRYABLE")
+    try:
+        scanned_object_path(session, get_filing(session, job.filing_version_id))
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
     job.status, job.stage, job.error_code, job.error_detail = "queued", "queued", None, None
     session.commit()
     workflow_runtime.dispatch_extract(job.id, background)
@@ -384,7 +439,10 @@ def list_facts(
     session: Session = Depends(get_session),
 ):
     get_filing(session, filing_version_id)
-    query = select(FinancialFact).where(FinancialFact.filing_version_id == filing_version_id)
+    query = select(FinancialFact).where(
+        FinancialFact.filing_version_id == filing_version_id,
+        FinancialFact.review_status != "superseded",
+    )
     if statement_type:
         query = query.where(FinancialFact.statement_type == statement_type)
     if quality_status:
@@ -406,11 +464,26 @@ def list_facts(
                 "quality_status": fact.quality_status,
                 "review_status": fact.review_status,
                 "revision_no": fact.revision_no,
+                "statement_type": fact.statement_type,
+                "period_start": fact.period_start,
+                "period_end": fact.period_end,
+                "comparative_period": fact.comparative_period,
+                "is_restatement": fact.is_restatement,
+                "raw_value": fact.raw_value,
                 "evidence": evidence,
                 "extractor": evidence.extractor if evidence else None,
             }
         )
     return envelope(request, facts)
+
+
+@app.get("/api/v1/filings/{filing_version_id}/validations")
+def list_validations(request: Request, filing_version_id: int, session: Session = Depends(get_session)):
+    filing = get_filing(session, filing_version_id)
+    results = list(session.scalars(select(ValidationResult).where(
+        ValidationResult.filing_version_id == filing.id,
+    ).order_by(ValidationResult.id)))
+    return envelope(request, {"filing_status": filing.status, "results": results})
 
 
 @app.patch("/api/v1/facts/{fact_id}/review")
@@ -420,6 +493,11 @@ def review_fact(
     fact = session.get(FinancialFact, fact_id)
     if fact is None:
         raise HTTPException(404, "FACT_NOT_FOUND")
+    if fact.review_status == "superseded":
+        raise HTTPException(409, "FACT_SUPERSEDED")
+    reviewer_id = payload.reviewer_id.strip()
+    if not reviewer_id:
+        raise HTTPException(422, "REVIEWER_REQUIRED")
     if payload.decision == "corrected":
         if payload.corrected_value is None:
             raise HTTPException(422, "CORRECTED_VALUE_REQUIRED")
@@ -436,9 +514,15 @@ def review_fact(
             flow_or_stock=fact.flow_or_stock,
             raw_value=fact.raw_value,
             revision_no=fact.revision_no + 1,
+            assurance_level=fact.assurance_level,
+            comparative_period=fact.comparative_period,
+            is_restatement=fact.is_restatement,
         )
         session.add(new_fact)
         session.flush()
+        for dimension in session.scalars(select(FactDimension).where(FactDimension.fact_id == fact.id)):
+            session.add(FactDimension(fact_id=new_fact.id, dimension_name=dimension.dimension_name,
+                                     dimension_value=dimension.dimension_value))
         old_evidence = session.scalar(
             select(EvidenceFragment).where(EvidenceFragment.fact_id == fact.id)
         )
@@ -451,7 +535,7 @@ def review_fact(
                     row_locator=old_evidence.row_locator,
                     column_locator=old_evidence.column_locator,
                     raw_label=old_evidence.raw_label,
-                    raw_value=str(payload.corrected_value),
+                    raw_value=old_evidence.raw_value,
                     bounding_box=old_evidence.bounding_box,
                     page_sha256=old_evidence.page_sha256,
                     confidence=old_evidence.confidence,
@@ -460,15 +544,22 @@ def review_fact(
             )
         fact.review_status, fact.quality_status = "superseded", "superseded"
         fact = new_fact
-    session.add(
-        FactReview(
+    review = session.scalar(select(FactReview).where(
+        FactReview.fact_id == fact.id, FactReview.reviewer_id == reviewer_id,
+    ))
+    if review is None:
+        review = FactReview(
             fact_id=fact.id,
-            reviewer_id=payload.reviewer_id,
+            reviewer_id=reviewer_id,
             decision=payload.decision,
             reason=payload.reason,
             evidence_digest=hashlib.sha256(json.dumps({"fact_id": fact.id, "value": str(fact.value), "reason": payload.reason}, sort_keys=True).encode()).hexdigest(),
         )
-    )
+        session.add(review)
+    else:
+        review.decision, review.reason = payload.decision, payload.reason
+        review.reviewed_at = datetime.now(UTC)
+        review.evidence_digest = stable_hash({"fact_id": fact.id, "value": str(fact.value), "reason": payload.reason})
     session.commit()
     status = recompute_filing_quality(session, fact.filing_version_id)
     session.query(AnalysisRun).filter(AnalysisRun.filing_version_id == fact.filing_version_id).update(
@@ -638,7 +729,10 @@ def create_analysis(
     filing = get_filing(session, filing_version_id)
     if filing.status not in {"facts_verified", "metrics_ready", "analysis_ready"}:
         raise HTTPException(409, "STRICT_AUDITED_INPUT_REQUIRED")
-    package = build_evidence_package(session, filing_version_id)
+    try:
+        package = build_evidence_package(session, filing_version_id)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
     if not package["metrics"]:
         raise HTTPException(409, "STRICT_METRICS_REQUIRED")
     snapshot_hash = hashlib.sha256(
@@ -768,7 +862,10 @@ def export(
     session: Session = Depends(get_session),
 ):
     get_filing(session, filing_version_id)
-    path = generate_export(session, filing_version_id, output_format)
+    try:
+        path = generate_export(session, filing_version_id, output_format)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
     contents = path.read_bytes()
     record_audit_event(
         session,

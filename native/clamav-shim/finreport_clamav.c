@@ -2,11 +2,69 @@
 
 /* The ClamAV header location is supplied by the native build environment. */
 #include <clamav.h>
+#include <stdint.h>
 #include <stdlib.h>
+
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 struct fr_clamav_engine {
     struct cl_engine *engine;
 };
+
+int fr_clamav_database_age(const char *database_dir, uint64_t *age_seconds) {
+    time_t age = 0;
+    cl_error_t rc;
+    if (!database_dir || !age_seconds) return CL_EARG;
+    rc = cl_cvdgetage(database_dir, &age);
+    if (rc != CL_SUCCESS) return rc;
+    if (age < 0) return CL_EFORMAT;
+    *age_seconds = (uint64_t)age;
+    return CL_SUCCESS;
+}
+
+/*
+ * Rust sets CVD_CERTS_DIR immediately before loading this DLL.  On Windows,
+ * that update is made through the process environment, while the MinGW CRT's
+ * getenv() view can be stale.  Read the OS environment directly so the
+ * explicit engine setting is reliable for both inherited and runtime values.
+ */
+static const char *fr_cvd_certs_dir(char *buffer, size_t buffer_size) {
+#if defined(_WIN32)
+    DWORD length = GetEnvironmentVariableA("CVD_CERTS_DIR", buffer, (DWORD)buffer_size);
+    if (length == 0 || length >= buffer_size || buffer[0] == '\0') return NULL;
+    return buffer;
+#else
+    const char *value = getenv("CVD_CERTS_DIR");
+    if (!value || value[0] == '\0') return NULL;
+    (void)buffer;
+    (void)buffer_size;
+    return value;
+#endif
+}
+
+/* An empty CVD_CERTS_DIR is different from an unset value to ClamAV and
+ * causes cl_engine_new() to retain an unusable empty certificate path. */
+static void fr_clear_empty_cvd_certs_env(void) {
+#if defined(_WIN32)
+    char buffer[2];
+    /* GetEnvironmentVariableA returns zero for both an empty and a missing
+     * variable; clearing in either case is harmless and normalizes the empty
+     * value before cl_engine_new() computes its platform default. */
+    buffer[0] = '\0';
+    if (GetEnvironmentVariableA("CVD_CERTS_DIR", buffer, sizeof(buffer)) == 0 ||
+        buffer[0] == '\0') {
+        /* Keep the MinGW CRT view in sync with the Windows process block;
+         * ClamAV itself calls CRT getenv() during cl_engine_new(). */
+        _putenv("CVD_CERTS_DIR=");
+        SetEnvironmentVariableA("CVD_CERTS_DIR", NULL);
+    }
+#else
+    const char *value = getenv("CVD_CERTS_DIR");
+    if (value && value[0] == '\0') unsetenv("CVD_CERTS_DIR");
+#endif
+}
 
 int fr_clamav_engine_create(const char *database_dir, fr_clamav_engine **out_engine) {
     unsigned int signature_count = 0;
@@ -15,8 +73,27 @@ int fr_clamav_engine_create(const char *database_dir, fr_clamav_engine **out_eng
     if (!database_dir || !out_engine) return CL_EARG;
     rc = cl_init(CL_INIT_DEFAULT);
     if (rc != CL_SUCCESS) return rc;
+    fr_clear_empty_cvd_certs_env();
     engine = cl_engine_new();
     if (!engine) return CL_EMEM;
+
+    /*
+     * cl_engine_new() reads CVD_CERTS_DIR for its initial default, but keep
+     * the certificate location explicit on the engine before loading any
+     * database.  An unset or empty variable leaves ClamAV's platform default
+     * intact; passing NULL to cl_engine_set_str() is not supported.
+     */
+    {
+        char certs_buffer[32768];
+        const char *certs_dir = fr_cvd_certs_dir(certs_buffer, sizeof(certs_buffer));
+        if (certs_dir && certs_dir[0] != '\0') {
+            rc = cl_engine_set_str(engine, CL_ENGINE_CVDCERTSDIR, certs_dir);
+            if (rc != CL_SUCCESS) {
+                cl_engine_free(engine);
+                return rc;
+            }
+        }
+    }
     rc = cl_load(database_dir, engine, &signature_count, CL_DB_STDOPT);
     if (rc == CL_SUCCESS) rc = cl_engine_compile(engine);
     if (rc != CL_SUCCESS) {
@@ -65,3 +142,4 @@ void fr_clamav_engine_free(fr_clamav_engine *wrapper) {
 }
 
 const char *fr_clamav_error_string(int code) { return cl_strerror(code); }
+const char *fr_clamav_version(void) { return cl_retver(); }

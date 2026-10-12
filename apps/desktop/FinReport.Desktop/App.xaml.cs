@@ -17,7 +17,7 @@ public partial class App : Application
         services.AddHttpClient<FinReportApiClient>(client =>
         {
             client.BaseAddress = new Uri("http://127.0.0.1:8000/");
-            client.Timeout = TimeSpan.FromSeconds(30);
+            client.Timeout = TimeSpan.FromMinutes(2);
         });
         services.AddSingleton<MainViewModel>();
         _services = services.BuildServiceProvider();
