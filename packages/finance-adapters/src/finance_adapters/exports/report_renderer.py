@@ -17,7 +17,7 @@ from finance_adapters.config import settings
 from finance_adapters.persistence.metric_gateway import (
     FORMULA_VERSION,
     _snapshot,
-    current_verified_facts,
+    metric_facts,
 )
 from finance_adapters.persistence.models import (
     AnalysisRun,
@@ -45,7 +45,18 @@ METRIC_NAMES = {
     "gross_margin": "毛利率",
     "net_margin": "归母净利率",
     "operating_cashflow_to_net_income": "经营现金流／合并净利润",
-    "free_cash_flow": "自由现金流",
+    "free_cash_flow": "自由现金流（购建长期资产现金代理）",
+    "current_ratio": "流动比率",
+    "debt_to_assets": "资产负债率",
+    "simple_average_roa": "总资产净利率（合并净利润/期初末简单平均总资产）",
+    "simple_average_parent_roe": "归母净资产收益率（期初末简单平均，非披露加权ROE）",
+    "inventory_turnover": "存货周转率（营业成本/期初末简单平均存货）",
+    "receivables_turnover": "应收账款周转率代理（营业收入/期初末平均应收账款净额，非赊销口径）",
+    "asset_turnover": "总资产周转率（营业收入/期初末简单平均总资产）",
+    "ebit_expensed_interest_proxy": "EBIT代理（利润总额加费用化利息，未含资本化利息）",
+    "expensed_interest_coverage_proxy": "费用化利息保障倍数（EBIT代理/费用化利息，不含资本化利息）",
+    "net_debt_cash_proxy": "净负债代理（指定五项债务减货币资金，含受限资金）",
+    "quick_ratio_proxy": "速动比率代理（流动资产减存货，未扣预付款）",
 }
 CSS = """
 body {font-family:Arial,'Microsoft YaHei',sans-serif;font-size:10pt;line-height:1.5;color:#202939}
@@ -77,6 +88,10 @@ def _number(value: Decimal | None) -> str:
 
 
 def _metric_unit(metric: MetricResult, facts: dict[int, FinancialFact]) -> str:
+    if metric.metric_code in {"inventory_turnover", "receivables_turnover", "asset_turnover"}:
+        return "次/年"
+    if metric.metric_code in {"current_ratio", "quick_ratio_proxy", "operating_cashflow_to_net_income", "expensed_interest_coverage_proxy"}:
+        return "倍"
     if metric.unit != "currency":
         return "比率（1 = 100%）" if metric.unit == "ratio" else metric.unit
     currencies = {facts[key].currency for key in metric.input_fact_ids if key in facts}
@@ -136,7 +151,7 @@ def _validated_inputs(session: Session, filing_id: int):
     if not output.claims or any(not claim.content.strip() for claim in output.claims):
         raise ValueError("EXPORT_ANALYSIS_CLAIMS_REQUIRED")
     try:
-        current_facts = current_verified_facts(session, filing)
+        current_facts = metric_facts(session, filing)
     except ValueError as exc:
         raise ValueError(f"EXPORT_STRICT_INPUT_INVALID:{exc}") from exc
     if not current_facts:
@@ -247,15 +262,16 @@ def _render_html(
         for item in attempts
     )
     context = package.get("document_context", {})
+    context_label = "OCR上下文" if str(context.get("extractor_version", "")).startswith("ocr") else "原生文字上下文"
     selected_sources = {
         assertion.source_id for claim in output.claims for assertion in claim.source_assertions
     }
     context_rows = "".join(
-        f"<li>原生上下文 {_escape(item['id'])}，PDF第{item['page_no']}页，"
+        f"<li>{context_label} {_escape(item['id'])}，PDF第{item['page_no']}页，"
         f"未人审；选项：{_escape(item.get('selected_answer') or item.get('selection_status'))}。"
         f"<br>{_escape(item['text']).replace(chr(10), '<br>')}</li>"
         for item in context.get("excerpts", []) if item["id"] in selected_sources
-    ) or "<li>本次模型没有引用原生文字上下文。</li>"
+    ) or "<li>本次模型没有引用文字上下文。</li>"
     review_summary = _escape(output.qualitative_summary) or "模型未提供定性总结。"
     review_mode = ("用户授权的测试豁免：未完成双人独立复核，不构成正式人审通过。"
                    if test_waiver else "按当前事实审核状态生成；具体审核记录见审计轨迹。")
@@ -289,7 +305,7 @@ def _render_html(
 <table><tr><th>调用</th><th>供应商响应ID</th><th>校验结果</th><th>耗时秒</th><th>总tokens</th><th>思考字段</th></tr>{execution_rows}</table>
 <p class="meta">供应商暴露的思考文本不等于完整内部推理，也不证明财务结论正确。原始请求、响应、失败校验和渲染前后对照保存在复现包中。</p>
 <p>离线复现包接口：/api/v1/analyses/{analysis.id}/reproduction。离线重放校验原有输入输出；再次联网调用模型不保证逐字相同。哈希不能防止数据库管理员同时改写数据与哈希。</p>
-<h3>模型引用的原生文字上下文</h3><ul class="evidence">{context_rows}</ul>
+<h3>模型引用的{context_label}</h3><ul class="evidence">{context_rows}</ul>
 <h2>分析边界与限制</h2><ul class="limitations">{limitations}</ul>
 <footer>仅供研究与教学，不构成投资建议。导出使用已完成且未失效的分析，并与当前输入快照核对一致。</footer>
 </body></html>"""

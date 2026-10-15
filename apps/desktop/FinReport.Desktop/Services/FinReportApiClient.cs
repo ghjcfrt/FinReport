@@ -6,7 +6,7 @@ using System.Text.Json;
 namespace FinReport.Desktop.Services;
 
 /// <summary>HTTP boundary for the desktop app. It never accesses storage, database, or model providers.</summary>
-public sealed class FinReportApiClient(HttpClient http)
+public sealed partial class FinReportApiClient(HttpClient http)
 {
     private static readonly JsonSerializerOptions ApiJson = new(JsonSerializerDefaults.Web) { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
     public async Task<long> UploadAsync(string filePath, string stockCode, string companyName, int reportYear, CancellationToken cancellationToken)
@@ -28,9 +28,15 @@ public sealed class FinReportApiClient(HttpClient http)
         return body.RootElement.GetProperty("data").GetProperty("filing_version_id").GetInt64();
     }
 
-    public async Task<long> StartJobAsync(long filingId, CancellationToken cancellationToken)
+    public Task<long> StartJobAsync(long filingId, CancellationToken cancellationToken)
+        => StartJobAsync(filingId, "pdf_text", cancellationToken);
+
+    public async Task<long> StartJobAsync(long filingId, string extractionMethod, CancellationToken cancellationToken)
     {
-        using var response = await http.PostAsync($"api/v1/filings/{filingId}/jobs", null, cancellationToken);
+        if (extractionMethod is not ("pdf_text" or "ocr"))
+            throw new ArgumentException("请选择直接 PDF 提取或 OCR 识别。", nameof(extractionMethod));
+        using var response = await http.PostAsJsonAsync($"api/v1/filings/{filingId}/jobs",
+            new { extraction_method = extractionMethod }, ApiJson, cancellationToken);
         await EnsureSuccessAsync(response, cancellationToken);
         using var body = JsonDocument.Parse(await response.Content.ReadAsStreamAsync(cancellationToken));
         return body.RootElement.GetProperty("data").GetProperty("job_id").GetInt64();
@@ -174,7 +180,7 @@ public sealed class FinReportApiClient(HttpClient http)
     private sealed record ApiEnvelope<T>(T Data, string RequestId);
 }
 
-public sealed record JobStatus(long JobId, string Stage, string Status, int Progress, string? ErrorCode, string? ErrorDetail, int ReviewCount);
+public sealed record JobStatus(long JobId, string Stage, string Status, int Progress, string? ErrorCode, string? ErrorDetail, int ReviewCount, string? ExtractionMethod = null, bool ReviewRequired = true);
 public sealed record ModelSettings(ModelEndpoint Analysis, ModelEndpoint Ocr, string[] SupportedProviders, bool SecretsManagedServerSide);
 public sealed record ModelEndpoint(string Provider, string? BaseUrl, string? Model, bool Configured, bool CredentialsConfigured);
 public sealed record ModelSettingsUpdate(ModelEndpointUpdate Analysis, ModelEndpointUpdate Ocr);
@@ -224,7 +230,10 @@ public sealed record OriginalTableItem(
     string? Extractor,
     decimal? Confidence,
     bool ReviewRequired,
-    string? PageSha256);
+    string? PageSha256,
+    string? SourceText = null,
+    long? OcrCallId = null,
+    string? ResponseSha256 = null);
 public sealed record OriginalTableRow(
     string[]? Cells,
     string? RawLabel,

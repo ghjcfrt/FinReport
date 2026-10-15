@@ -42,6 +42,417 @@
         }
       }
     },
+    "/api/v1/filings/{filing_version_id}/ocr-mapping-context": {
+      "get": {
+        "summary": "Get Ocr Mapping Context",
+        "operationId": "get_ocr_mapping_context_api_v1_filings__filing_version_id__ocr_mapping_context_get",
+        "parameters": [
+          {
+            "name": "filing_version_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Filing Version Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/filings/{filing_version_id}/ocr-pages/{page_no}.png": {
+      "get": {
+        "summary": "Get Ocr Page Image",
+        "operationId": "get_ocr_page_image_api_v1_filings__filing_version_id__ocr_pages__page_no__png_get",
+        "parameters": [
+          {
+            "name": "filing_version_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Filing Version Id"
+            }
+          },
+          {
+            "name": "page_no",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Page No"
+            }
+          },
+          {
+            "name": "ocr_call_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "title": "Ocr Call Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/filings/{filing_version_id}/ocr-fact-mappings": {
+      "post": {
+        "summary": "Create Ocr Fact Mapping",
+        "operationId": "create_ocr_fact_mapping_api_v1_filings__filing_version_id__ocr_fact_mappings_post",
+        "parameters": [
+          {
+            "name": "filing_version_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Filing Version Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OcrFactMappingRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/filings/{filing_version_id}/ocr-audit-confirmations": {
+      "post": {
+        "summary": "Create Ocr Audit Confirmation",
+        "operationId": "create_ocr_audit_confirmation_api_v1_filings__filing_version_id__ocr_audit_confirmations_post",
+        "parameters": [
+          {
+            "name": "filing_version_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Filing Version Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OcrAuditConfirmationRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/filings/{filing_version_id}/ocr-mapping-completion": {
+      "post": {
+        "summary": "Create Ocr Mapping Completion",
+        "operationId": "create_ocr_mapping_completion_api_v1_filings__filing_version_id__ocr_mapping_completion_post",
+        "parameters": [
+          {
+            "name": "filing_version_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Filing Version Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OcrMappingCompletionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/filings/{filing_version_id}/annual-disclosures": {
+      "get": {
+        "summary": "Get Annual Disclosures",
+        "operationId": "get_annual_disclosures_api_v1_filings__filing_version_id__annual_disclosures_get",
+        "parameters": [
+          {
+            "name": "filing_version_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Filing Version Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/filings/{filing_version_id}/annual-disclosures/{candidate_id}/review": {
+      "patch": {
+        "summary": "Patch Annual Disclosure Review",
+        "operationId": "patch_annual_disclosure_review_api_v1_filings__filing_version_id__annual_disclosures__candidate_id__review_patch",
+        "parameters": [
+          {
+            "name": "filing_version_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Filing Version Id"
+            }
+          },
+          {
+            "name": "candidate_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Candidate Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DisclosureReviewRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/filings/{filing_version_id}/annual-disclosures/extract": {
+      "post": {
+        "summary": "Post Annual Disclosure Extraction",
+        "operationId": "post_annual_disclosure_extraction_api_v1_filings__filing_version_id__annual_disclosures_extract_post",
+        "parameters": [
+          {
+            "name": "filing_version_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Filing Version Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/filings/{filing_version_id}/ocr-annual-disclosure-mappings": {
+      "post": {
+        "summary": "Post Ocr Annual Disclosure Mapping",
+        "operationId": "post_ocr_annual_disclosure_mapping_api_v1_filings__filing_version_id__ocr_annual_disclosure_mappings_post",
+        "parameters": [
+          {
+            "name": "filing_version_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Filing Version Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OcrDisclosureMappingRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/health": {
       "get": {
         "summary": "Health",
@@ -242,6 +653,23 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ExtractionRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Payload"
+              }
+            }
+          }
+        },
         "responses": {
           "202": {
             "description": "Successful Response",
@@ -1178,6 +1606,54 @@
         ],
         "title": "ComparisonRequest"
       },
+      "DisclosureReviewRequest": {
+        "properties": {
+          "reviewer_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Reviewer Id"
+          },
+          "decision": {
+            "type": "string",
+            "enum": [
+              "confirmed",
+              "rejected"
+            ],
+            "title": "Decision"
+          },
+          "reason": {
+            "type": "string",
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Reason"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "reviewer_id",
+          "decision",
+          "reason"
+        ],
+        "title": "DisclosureReviewRequest"
+      },
+      "ExtractionRequest": {
+        "properties": {
+          "extraction_method": {
+            "type": "string",
+            "enum": [
+              "pdf_text",
+              "ocr"
+            ],
+            "title": "Extraction Method",
+            "default": "pdf_text"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "ExtractionRequest"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -1237,6 +1713,514 @@
           "base_url"
         ],
         "title": "ModelDiscoveryRequest"
+      },
+      "OcrAuditConfirmationRequest": {
+        "properties": {
+          "ocr_call_id": {
+            "type": "integer",
+            "exclusiveMinimum": 0.0,
+            "title": "Ocr Call Id"
+          },
+          "page_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Page Sha256"
+          },
+          "response_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Response Sha256"
+          },
+          "quote": {
+            "type": "string",
+            "maxLength": 12000,
+            "minLength": 20,
+            "title": "Quote"
+          },
+          "bbox": {
+            "items": {
+              "type": "number"
+            },
+            "type": "array",
+            "maxItems": 4,
+            "minItems": 4,
+            "title": "Bbox"
+          },
+          "opinion": {
+            "type": "string",
+            "const": "standard_unqualified",
+            "title": "Opinion"
+          },
+          "reviewer_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Reviewer Id"
+          },
+          "reason": {
+            "type": "string",
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Reason"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "ocr_call_id",
+          "page_sha256",
+          "response_sha256",
+          "quote",
+          "bbox",
+          "opinion",
+          "reviewer_id",
+          "reason"
+        ],
+        "title": "OcrAuditConfirmationRequest"
+      },
+      "OcrDisclosureMappingRequest": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "title": "Code"
+          },
+          "table_id": {
+            "type": "integer",
+            "exclusiveMinimum": 0.0,
+            "title": "Table Id"
+          },
+          "ocr_call_id": {
+            "type": "integer",
+            "exclusiveMinimum": 0.0,
+            "title": "Ocr Call Id"
+          },
+          "page_sha256": {
+            "type": "string",
+            "pattern": "^[a-fA-F0-9]{64}$",
+            "title": "Page Sha256"
+          },
+          "response_sha256": {
+            "type": "string",
+            "pattern": "^[a-fA-F0-9]{64}$",
+            "title": "Response Sha256"
+          },
+          "row_index": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Row Index"
+          },
+          "column_index": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Column Index"
+          },
+          "raw_label": {
+            "type": "string",
+            "title": "Raw Label"
+          },
+          "raw_value": {
+            "type": "string",
+            "title": "Raw Value"
+          },
+          "corrected_raw_value": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Corrected Raw Value"
+          },
+          "column_label": {
+            "type": "string",
+            "title": "Column Label"
+          },
+          "unit_text": {
+            "type": "string",
+            "title": "Unit Text"
+          },
+          "unit_ocr_call_id": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unit Ocr Call Id"
+          },
+          "unit_page_sha256": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[a-fA-F0-9]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unit Page Sha256"
+          },
+          "unit_response_sha256": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[a-fA-F0-9]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unit Response Sha256"
+          },
+          "unit_scale": {
+            "type": "integer",
+            "title": "Unit Scale",
+            "default": 1
+          },
+          "currency": {
+            "type": "string",
+            "const": "CNY",
+            "title": "Currency",
+            "default": "CNY"
+          },
+          "value_bbox": {
+            "items": {
+              "type": "number"
+            },
+            "type": "array",
+            "maxItems": 4,
+            "minItems": 4,
+            "title": "Value Bbox"
+          },
+          "row_bbox": {
+            "items": {
+              "type": "number"
+            },
+            "type": "array",
+            "maxItems": 4,
+            "minItems": 4,
+            "title": "Row Bbox"
+          },
+          "unit_bbox": {
+            "items": {
+              "type": "number"
+            },
+            "type": "array",
+            "maxItems": 4,
+            "minItems": 4,
+            "title": "Unit Bbox"
+          },
+          "reviewer_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Reviewer Id"
+          },
+          "reason": {
+            "type": "string",
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Reason"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "code",
+          "table_id",
+          "ocr_call_id",
+          "page_sha256",
+          "response_sha256",
+          "row_index",
+          "column_index",
+          "raw_label",
+          "raw_value",
+          "column_label",
+          "unit_text",
+          "value_bbox",
+          "row_bbox",
+          "unit_bbox",
+          "reviewer_id",
+          "reason"
+        ],
+        "title": "OcrDisclosureMappingRequest"
+      },
+      "OcrFactMappingRequest": {
+        "properties": {
+          "table_id": {
+            "type": "integer",
+            "exclusiveMinimum": 0.0,
+            "title": "Table Id"
+          },
+          "ocr_call_id": {
+            "type": "integer",
+            "exclusiveMinimum": 0.0,
+            "title": "Ocr Call Id"
+          },
+          "page_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Page Sha256"
+          },
+          "response_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Response Sha256"
+          },
+          "row_index": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Row Index"
+          },
+          "column_index": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Column Index"
+          },
+          "concept_code": {
+            "type": "string",
+            "maxLength": 96,
+            "minLength": 1,
+            "title": "Concept Code"
+          },
+          "raw_label": {
+            "type": "string",
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Raw Label"
+          },
+          "raw_value": {
+            "type": "string",
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Raw Value"
+          },
+          "corrected_raw_value": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 256,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Corrected Raw Value"
+          },
+          "unit_scale": {
+            "type": "integer",
+            "enum": [
+              1,
+              1000,
+              10000,
+              1000000,
+              100000000
+            ],
+            "title": "Unit Scale"
+          },
+          "currency": {
+            "type": "string",
+            "const": "CNY",
+            "title": "Currency"
+          },
+          "period_role": {
+            "type": "string",
+            "enum": [
+              "current",
+              "comparative"
+            ],
+            "title": "Period Role"
+          },
+          "period_start": {
+            "type": "string",
+            "format": "date",
+            "title": "Period Start"
+          },
+          "period_end": {
+            "type": "string",
+            "format": "date",
+            "title": "Period End"
+          },
+          "scope": {
+            "type": "string",
+            "const": "consolidated",
+            "title": "Scope"
+          },
+          "accounting_standard": {
+            "type": "string",
+            "const": "PRC_ASBE",
+            "title": "Accounting Standard"
+          },
+          "is_restatement": {
+            "type": "boolean",
+            "title": "Is Restatement",
+            "default": false
+          },
+          "table_name": {
+            "type": "string",
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Table Name"
+          },
+          "column_label": {
+            "type": "string",
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Column Label"
+          },
+          "value_bbox": {
+            "items": {
+              "type": "number"
+            },
+            "type": "array",
+            "maxItems": 4,
+            "minItems": 4,
+            "title": "Value Bbox"
+          },
+          "row_bbox": {
+            "items": {
+              "type": "number"
+            },
+            "type": "array",
+            "maxItems": 4,
+            "minItems": 4,
+            "title": "Row Bbox"
+          },
+          "unit_text": {
+            "type": "string",
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Unit Text"
+          },
+          "unit_bbox": {
+            "items": {
+              "type": "number"
+            },
+            "type": "array",
+            "maxItems": 4,
+            "minItems": 4,
+            "title": "Unit Bbox"
+          },
+          "unit_ocr_call_id": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unit Ocr Call Id"
+          },
+          "unit_page_sha256": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unit Page Sha256"
+          },
+          "unit_response_sha256": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unit Response Sha256"
+          },
+          "reviewer_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Reviewer Id"
+          },
+          "reason": {
+            "type": "string",
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Reason"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "table_id",
+          "ocr_call_id",
+          "page_sha256",
+          "response_sha256",
+          "row_index",
+          "column_index",
+          "concept_code",
+          "raw_label",
+          "raw_value",
+          "unit_scale",
+          "currency",
+          "period_role",
+          "period_start",
+          "period_end",
+          "scope",
+          "accounting_standard",
+          "table_name",
+          "column_label",
+          "value_bbox",
+          "row_bbox",
+          "unit_text",
+          "unit_bbox",
+          "reviewer_id",
+          "reason"
+        ],
+        "title": "OcrFactMappingRequest",
+        "description": "A human transcription from a located OCR table cell, never an approval."
+      },
+      "OcrMappingCompletionRequest": {
+        "properties": {
+          "job_id": {
+            "type": "integer",
+            "exclusiveMinimum": 0.0,
+            "title": "Job Id"
+          },
+          "file_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "File Sha256"
+          },
+          "reviewer_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Reviewer Id"
+          },
+          "reason": {
+            "type": "string",
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Reason"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "job_id",
+          "file_sha256",
+          "reviewer_id",
+          "reason"
+        ],
+        "title": "OcrMappingCompletionRequest"
       },
       "ReviewRequest": {
         "properties": {

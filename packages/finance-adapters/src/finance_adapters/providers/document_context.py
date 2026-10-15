@@ -5,11 +5,12 @@ import re
 from pathlib import Path
 
 import pymupdf
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from finance_adapters.parsing.statement_extractor import page_rows
 from finance_adapters.persistence.audit import stable_hash
-from finance_adapters.persistence.models import FilingVersion
+from finance_adapters.persistence.models import ExtractionJob, FilingVersion, OcrCall
 from finance_adapters.security.file_gate import scanned_object_path
 
 CONTEXT_VERSION = "native-context-v2"
@@ -29,6 +30,13 @@ LIMITATIONS = [
     "摘录是按固定关键词和勾选项选择的局部上下文，不得据此声称全报告未披露。",
     "勾选答案必须连同问项解释；精确引用和选项匹配不等于完整语义核验。",
     "无法定位完整问项起点或跨页未闭合的问项标记incomplete_question，不可作为独立定性证据。",
+]
+OCR_CONTEXT_VERSION = "ocr-context-v1"
+OCR_LIMITATIONS = [
+    "上下文仅来自当前OCR任务保存的逐页原始输出，没有读取PDF文字层或文字坐标。",
+    "OCR上下文未经财务复核，不属于严格事实；可能存在漏字、错字和阅读顺序错误。",
+    "只选取预算内的完整逐页OCR响应；省略计数不代表原财报未披露。",
+    "OCR未核实问项边界及勾选位置，含问项或勾选的页面不能独立支持定性结论。",
 ]
 
 
@@ -159,7 +167,68 @@ def extract_document_context(path: Path, source_sha256: str) -> dict:
     }
 
 
+def _ocr_document_context(session: Session, filing: FilingVersion, job: ExtractionJob) -> dict:
+    """Use saved OCR output only; do not silently switch the chosen extractor."""
+    calls = list(session.scalars(select(OcrCall).where(
+        OcrCall.extraction_job_id == job.id,
+    ).order_by(OcrCall.id)))
+    latest = {}
+    for call in calls:
+        if job.started_at is not None and call.started_at is not None and call.started_at >= job.started_at:
+            latest[call.page_no] = call
+    excerpts, characters, candidates, incomplete = [], 0, 0, 0
+    omitted = {"excerpt_character_limit": 0, "context_character_limit": 0,
+               "excerpt_count_limit": 0, "invalid_or_failed_response": 0}
+    for page_no, call in sorted(latest.items()):
+        text = call.response_text or ""
+        if (call.status != "completed" or not text
+                or hashlib.sha256(text.encode("utf-8")).hexdigest() != call.response_hash):
+            omitted["invalid_or_failed_response"] += 1
+            continue
+        if not (TOPIC.search(text) or CHECKED_OPTION.search(text)):
+            continue
+        candidates += 1
+        if len(text) > MAX_EXCERPT_CHARACTERS:
+            omitted["excerpt_character_limit"] += 1
+            continue
+        if len(excerpts) >= MAX_EXCERPTS:
+            omitted["excerpt_count_limit"] += 1
+            continue
+        if characters + len(text) > MAX_CONTEXT_CHARACTERS:
+            omitted["context_character_limit"] += 1
+            continue
+        is_question = bool(QUESTION_START.search(text) or CHECKED_OPTION.search(text))
+        incomplete += int(is_question)
+        excerpts.append({
+            "id": f"ocr-{job.id}-{call.id}-p{page_no}", "page_no": page_no,
+            "line_ids": [f"ocr-call:{call.id}"], "context_line_ids": [f"ocr-call:{call.id}"],
+            "text": text, "bbox": None, "page_sha256": call.page_sha256,
+            "text_sha256": call.response_hash, "ocr_call_id": call.id,
+            "selected_answer": None, "selection_status": "ambiguous" if is_question else "not_a_checkbox",
+            "question_completeness": "incomplete_question" if is_question else "not_a_checkbox",
+            "review_status": "unreviewed_ocr_context",
+        })
+        characters += len(text)
+    return {
+        "status": "available" if excerpts else "no_matching_ocr_context",
+        "source_sha256": filing.file_sha256, "extractor_version": OCR_CONTEXT_VERSION,
+        "extraction_job_id": job.id, "total_pages": len(latest), "native_text_pages": 0,
+        "scanned_page_numbers": sorted(latest),
+        "selected_page_numbers": [item["page_no"] for item in excerpts],
+        "model_input_line_count": len(excerpts), "model_input_characters": characters,
+        "candidate_excerpt_count": candidates, "omitted_excerpt_count": candidates - len(excerpts),
+        "omission_reasons": omitted, "incomplete_question_count": incomplete,
+        "selection_policy": "whole current OCR page response; topic filter; bounded count and characters",
+        "excerpts": excerpts, "limitations": OCR_LIMITATIONS,
+    }
+
+
 def build_document_context(session: Session, filing: FilingVersion) -> dict:
+    job = session.scalar(select(ExtractionJob).where(
+        ExtractionJob.filing_version_id == filing.id,
+    ).order_by(ExtractionJob.id.desc()).limit(1))
+    if job is not None and job.extraction_method == "ocr":
+        return _ocr_document_context(session, filing, job)
     try:
         path = scanned_object_path(session, filing)
     except ValueError as exc:

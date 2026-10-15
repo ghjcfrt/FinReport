@@ -6,6 +6,7 @@ from dataclasses import asdict
 from datetime import date
 from decimal import Decimal
 
+from finance_domain.filings.amounts import normalize_monetary_value
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -23,7 +24,7 @@ from finance_adapters.persistence.models import (
     FinancialFact,
 )
 
-COMPARATIVE_VERSION = "native-comparative-v1"
+COMPARATIVE_VERSION = "native-comparative-v2"
 
 
 def comparative_candidates(extractor: StatementExtractor, target_year: int) -> list[dict]:
@@ -57,7 +58,7 @@ def comparative_candidates(extractor: StatementExtractor, target_year: int) -> l
         if value is None or not value.is_finite():
             continue
         results.append({
-            "current": current, "value": value * current.unit_scale,
+            "current": current, "value": normalize_monetary_value(value, current.unit_scale),
             "raw_value": row.cells[prior_column], "column_label": header,
             "period_start": date(target_year - 1, 1, 1),
             "period_end": date(target_year - 1, 12, 31),
@@ -87,6 +88,14 @@ def persist_comparative_candidates(
                    select(FactReview.id).where(FactReview.fact_id == item.id)) is not None)
                for item in previous):
             continue
+        for previous_fact in previous:
+            if (previous_fact.comparative_period
+                    and previous_fact.quality_status == "candidate"
+                    and previous_fact.review_status == "needs_review"
+                    and session.scalar(select(FactReview.id).where(
+                        FactReview.fact_id == previous_fact.id,
+                    )) is None):
+                previous_fact.quality_status = previous_fact.review_status = "superseded"
         fact = FinancialFact(
             filing_version_id=filing.id, concept_code=current.concept_code,
             concept_name=current.concept_name, statement_type=current.statement_type,

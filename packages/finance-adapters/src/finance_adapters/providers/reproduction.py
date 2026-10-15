@@ -4,8 +4,8 @@ import hashlib
 import importlib.metadata
 import platform
 import subprocess
-from datetime import UTC, datetime
-from decimal import Decimal
+from datetime import UTC, date, datetime
+from decimal import Decimal, localcontext
 from pathlib import Path
 
 from finance_adapters.persistence.audit import stable_hash
@@ -22,10 +22,21 @@ SOURCE_FILES = (
     "packages/finance-domain/src/finance_domain/analysis/contracts.py",
     "packages/finance-domain/src/finance_domain/metrics/definitions.py",
     "packages/finance-domain/src/finance_domain/metrics/formulas.py",
+    "packages/finance-domain/src/finance_domain/filings/concepts.py",
+    "packages/finance-domain/src/finance_domain/filings/amounts.py",
+    "packages/finance-domain/src/finance_domain/filings/disclosures.py",
+    "packages/finance-adapters/src/finance_adapters/parsing/annual_disclosures.py",
+    "packages/finance-adapters/src/finance_adapters/persistence/disclosure_gateway.py",
+    "packages/finance-adapters/src/finance_adapters/exports/report_renderer.py",
+    "packages/finance-adapters/src/finance_adapters/persistence/mapping_gateway.py",
+    "packages/finance-adapters/src/finance_adapters/persistence/review_gateway.py",
+    "packages/finance-adapters/src/finance_adapters/parsing/pdf_parser.py",
+    "packages/finance-adapters/src/finance_adapters/parsing/comparative.py",
+    "packages/finance-adapters/src/finance_adapters/parsing/statement_extractor.py",
     "tools/replay-analysis.py", "pyproject.toml", "uv.lock",
 )
 STAGES = ("structure", "reference", "numeric", "semantic")
-REFERENCE_FORMULA_VERSION = "general-non-financial-v2"
+REFERENCE_FORMULA_VERSION = "general-non-financial-v4"
 REFERENCE_FORMULAS = {
     "revenue": ("revenue", ("revenue",), "currency"),
     "operating_profit": ("operating_profit", ("operating_profit",), "currency"),
@@ -35,6 +46,17 @@ REFERENCE_FORMULAS = {
     "gross_margin": ("(revenue - operating_cost) / revenue", ("revenue", "operating_cost"), "ratio"),
     "net_margin": ("net_income_attributable / revenue", ("net_income_attributable", "revenue"), "ratio"),
     "operating_cashflow_to_net_income": ("cashflow_operations / net_income", ("cashflow_operations", "net_income"), "ratio"),
+    "current_ratio": ("total_current_assets / total_current_liabilities", ("total_current_assets", "total_current_liabilities"), "ratio"),
+    "debt_to_assets": ("total_liabilities / total_assets", ("total_liabilities", "total_assets"), "ratio"),
+    "quick_ratio_proxy": ("(total_current_assets - inventories) / total_current_liabilities", ("total_current_assets", "inventories", "total_current_liabilities"), "ratio"),
+    "simple_average_roa": ("net_income / ((total_assets + beginning_total_assets) / 2)", ("net_income", "total_assets", "beginning_total_assets"), "ratio"),
+    "simple_average_parent_roe": ("net_income_attributable / ((equity_attributable + beginning_equity_attributable) / 2)", ("net_income_attributable", "equity_attributable", "beginning_equity_attributable"), "ratio"),
+    "inventory_turnover": ("operating_cost / ((inventories + beginning_inventories) / 2)", ("operating_cost", "inventories", "beginning_inventories"), "ratio"),
+    "receivables_turnover": ("revenue / ((accounts_receivable + beginning_accounts_receivable) / 2)", ("revenue", "accounts_receivable", "beginning_accounts_receivable"), "ratio"),
+    "asset_turnover": ("revenue / ((total_assets + beginning_total_assets) / 2)", ("revenue", "total_assets", "beginning_total_assets"), "ratio"),
+    "ebit_expensed_interest_proxy": ("profit_before_tax + interest_expense", ("profit_before_tax", "interest_expense"), "currency"),
+    "expensed_interest_coverage_proxy": ("(profit_before_tax + interest_expense) / interest_expense", ("profit_before_tax", "interest_expense"), "ratio"),
+    "net_debt_cash_proxy": ("short_term_borrowings + current_portion_noncurrent_liabilities + long_term_borrowings + bonds_payable + lease_liabilities - monetary_funds", ("short_term_borrowings", "current_portion_noncurrent_liabilities", "long_term_borrowings", "bonds_payable", "lease_liabilities", "monetary_funds"), "currency"),
 }
 
 
@@ -112,28 +134,67 @@ def _reference_metric(metric: dict) -> Decimal:
     formula, concepts, unit = REFERENCE_FORMULAS[code]
     if metric["formula"] != formula or metric["unit"] != unit:
         raise ValueError(f"REPLAY_REFERENCE_FORMULA_CONTRACT_MISMATCH:{code}")
-    if tuple(item["concept_code"] for item in metric["inputs"]) != concepts:
+    if tuple(item.get("input_key", item["concept_code"]) for item in metric["inputs"]) != concepts:
         raise ValueError(f"REPLAY_REFERENCE_INPUT_CONCEPTS_MISMATCH:{code}")
-    values = {item["concept_code"]: Decimal(item["value"]) for item in metric["inputs"]}
+    for key, item in zip(concepts, metric["inputs"], strict=True):
+        if item["concept_code"] != key.removeprefix("beginning_"):
+            raise ValueError(f"REPLAY_REFERENCE_INPUT_CONCEPTS_MISMATCH:{code}")
+    values = {key: Decimal(item["value"]) for key, item in zip(concepts, metric["inputs"], strict=True)}
     if any(not item.is_finite() for item in values.values()):
         raise ValueError("REPLAY_NON_FINITE_METRIC_INPUT")
-    if code in {"revenue", "operating_profit", "net_income_attributable", "cashflow_operations"}:
-        return values[code]
-    if code == "free_cash_flow":
-        if values["capex_cash"] < 0:
-            raise ValueError("REPLAY_NEGATIVE_CAPEX_CASH")
-        return values["cashflow_operations"] - values["capex_cash"]
-    if code in {"gross_margin", "net_margin"}:
-        denominator = values["revenue"]
-        numerator = (denominator - values["operating_cost"] if code == "gross_margin"
-                     else values["net_income_attributable"])
-    elif code == "operating_cashflow_to_net_income":
-        numerator, denominator = values["cashflow_operations"], values["net_income"]
-    else:
-        raise ValueError("REPLAY_REFERENCE_FORMULA_UNSUPPORTED")
-    if denominator <= 0:
-        raise ValueError("REPLAY_NON_POSITIVE_DENOMINATOR")
-    return numerator / denominator
+    with localcontext() as context:
+        context.prec = 48
+        if code in {"revenue", "operating_profit", "net_income_attributable", "cashflow_operations"}:
+            return values[code]
+        if code == "free_cash_flow":
+            if values["capex_cash"] < 0:
+                raise ValueError("REPLAY_NEGATIVE_CAPEX_CASH")
+            return values["cashflow_operations"] - values["capex_cash"]
+        if code in {"ebit_expensed_interest_proxy", "expensed_interest_coverage_proxy"}:
+            profit, interest = values["profit_before_tax"], values["interest_expense"]
+            if interest < 0:
+                raise ValueError("REPLAY_NEGATIVE_INTEREST_EXPENSE")
+            if code == "expensed_interest_coverage_proxy":
+                if interest <= 0:
+                    raise ValueError("REPLAY_NON_POSITIVE_INTEREST_EXPENSE")
+                return (profit + interest) / interest
+            return profit + interest
+        if code == "net_debt_cash_proxy":
+            if any(value < 0 for value in values.values()):
+                raise ValueError("REPLAY_NEGATIVE_BALANCE_INPUT")
+            return sum((values[key] for key in concepts[:-1]), Decimal(0)) - values["monetary_funds"]
+        if code in {"simple_average_roa", "simple_average_parent_roe", "inventory_turnover", "receivables_turnover", "asset_turnover"}:
+            numerator, closing, opening = (values[key] for key in concepts)
+            if min(closing, opening) < 0:
+                raise ValueError("REPLAY_NEGATIVE_BALANCE_INPUT")
+            if code in {"inventory_turnover", "receivables_turnover", "asset_turnover"} and numerator < 0:
+                raise ValueError("REPLAY_NEGATIVE_TURNOVER_FLOW")
+            denominator = (closing + opening) / 2
+        elif code == "quick_ratio_proxy":
+            assets, inventories, denominator = (values[key] for key in concepts)
+            if min(assets, inventories) < 0 or inventories > assets:
+                raise ValueError("REPLAY_INVALID_QUICK_ASSET_PROXY_INPUT")
+            numerator = assets - inventories
+        elif code in {"gross_margin", "net_margin"}:
+            denominator = values["revenue"]
+            numerator = (denominator - values["operating_cost"] if code == "gross_margin"
+                         else values["net_income_attributable"])
+        elif code == "operating_cashflow_to_net_income":
+            numerator, denominator = values["cashflow_operations"], values["net_income"]
+        elif code == "current_ratio":
+            numerator, denominator = values["total_current_assets"], values["total_current_liabilities"]
+        elif code == "debt_to_assets":
+            numerator, denominator = values["total_liabilities"], values["total_assets"]
+        else:
+            raise ValueError("REPLAY_REFERENCE_FORMULA_UNSUPPORTED")
+        if denominator <= 0:
+            raise ValueError("REPLAY_NON_POSITIVE_DENOMINATOR")
+        if code in {"current_ratio", "debt_to_assets"} and numerator < 0:
+            raise ValueError("REPLAY_NEGATIVE_BALANCE_INPUT")
+        if code == "gross_margin" and values["operating_cost"] < 0:
+            raise ValueError("REPLAY_NEGATIVE_OPERATING_COST")
+        return numerator / denominator
+
 
 
 def _reference_results(package: dict) -> list[dict]:
@@ -144,7 +205,9 @@ def _reference_results(package: dict) -> list[dict]:
         raise ValueError("REPLAY_METRIC_CODES_DUPLICATED")
     results = []
     for metric in metrics:
-        expected = _reference_metric(metric).quantize(Decimal("0.00000001"))
+        with localcontext() as context:
+            context.prec = 48
+            expected = _reference_metric(metric).quantize(Decimal("0.00000001"))
         if expected != Decimal(metric["value"]):
             raise ValueError(f"REPLAY_REFERENCE_METRIC_MISMATCH:{metric['code']}")
         if metric["input_fact_ids"] != [item["fact_id"] for item in metric["inputs"]]:
@@ -157,8 +220,17 @@ def _reference_results(package: dict) -> list[dict]:
                 raise ValueError("REPLAY_REFERENCE_INPUT_UNIT_OR_EVIDENCE_MISMATCH")
             if any(ref not in evidence or evidence[ref]["fact_id"] != item["fact_id"] for ref in item["evidence_ids"]):
                 raise ValueError("REPLAY_REFERENCE_EVIDENCE_FACT_MISMATCH")
+            beginning = item.get("input_role") == "beginning_balance"
+            if beginning != item.get("input_key", "").startswith("beginning_"):
+                raise ValueError("REPLAY_REFERENCE_INPUT_ROLE_MISMATCH")
+            if beginning and (item.get("flow_or_stock") != "stock" or item.get("comparative_period") is not True):
+                raise ValueError("REPLAY_REFERENCE_BEGINNING_STOCK_REQUIRED")
             for field in ("scope", "period_start", "period_end"):
-                if item[field] != metric[field] or metric[field] != package["analysis_scope"][field]:
+                expected_field = metric[field]
+                if beginning and field != "scope":
+                    year = date.fromisoformat(metric["period_end"]).year - 1
+                    expected_field = f"{year}-01-01" if field == "period_start" else f"{year}-12-31"
+                if item[field] != expected_field or metric[field] != package["analysis_scope"][field]:
                     raise ValueError("REPLAY_REFERENCE_INPUT_SCOPE_OR_PERIOD_MISMATCH")
         results.append({"code": metric["code"], "reference_value": str(expected), "passed": True})
     return results
@@ -474,7 +546,8 @@ def replay_bundle(bundle: dict, source_pdf: Path | None = None) -> dict:
         "analysis_status": analysis_status, "failure_reason": payload.get("failure_reason"),
         "payload_sha256": bundle["payload_sha256"], "input_snapshot_hash": payload["input_snapshot_hash"],
         "reference_metrics": reference_results, "reference_metric_count": len(reference_results),
-        "all_eight_supported_metrics_present": {item["code"] for item in reference_results} == set(REFERENCE_FORMULAS),
+        "all_supported_metrics_present": {item["code"] for item in reference_results} == set(REFERENCE_FORMULAS),
+        "supported_metric_count": len(REFERENCE_FORMULAS),
         "attempts": attempt_results, "rendered_output_matches": True if analysis_status == "completed" else None,
         "source_code_matches": code_match, "source_pdf_matches": pdf_verified,
         "runtime_provenance": {

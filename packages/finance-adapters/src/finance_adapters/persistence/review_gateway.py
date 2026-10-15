@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import re
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, localcontext
 
+from finance_domain.filings.concepts import STATEMENT_ALIASES, validate_concept_metadata
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -49,7 +50,8 @@ def _comparative_metadata_matches(fact: FinancialFact, filing: FilingVersion, ev
             return False
         if dates and dates != [(str(fact.period_end.year), "12", "31")]:
             return False
-        if fact.flow_or_stock == "stock" and not dates:
+        if (STATEMENT_ALIASES.get(fact.statement_type) == "资产负债表"
+                and fact.flow_or_stock == "stock" and not dates):
             return False
     return True
 
@@ -63,6 +65,10 @@ def recompute_filing_quality(session: Session, filing_id: int) -> str:
         ValidationResult.filing_version_id == filing_id,
         ValidationResult.rule_code.in_(QUALITY_RULES),
     ))
+    # OCR provenance is checked again after every mapping/review change. Mapping
+    # completeness and source assurance never stand in for human fact approval.
+    from finance_adapters.persistence.mapping_gateway import refresh_ocr_mapping_validation
+    refresh_ocr_mapping_validation(session, filing)
     facts = list(session.scalars(select(FinancialFact).where(
         FinancialFact.filing_version_id == filing_id,
         FinancialFact.review_status != 'superseded',
@@ -97,6 +103,7 @@ def recompute_filing_quality(session: Session, filing_id: int) -> str:
             and not fact.is_restatement
         )
         valid = (source_valid and period_valid
+                 and validate_concept_metadata(fact.concept_code, fact.statement_type, fact.flow_or_stock)
                  and fact.currency == 'CNY' and fact.unit_scale in {1, 1000, 10000, 1000000, 100000000}
                  and Decimal(fact.value).is_finite() and bool(scopes)
                  and fact.assurance_level == 'audited_annual'
@@ -129,11 +136,13 @@ def recompute_filing_quality(session: Session, filing_id: int) -> str:
         required = {left_code, *right_codes}
         if not required.issubset(by_code):
             return record(code, False, 'missing_required_fact', '+'.join(right_codes))
-        left = by_code[left_code].value
-        right = sum((by_code[c].value for c in right_codes), Decimal(0))
-        # Each displayed amount can round by half one original display unit.
-        tolerance = sum((Decimal(by_code[c].unit_scale) / 2 for c in required), Decimal(0))
-        return record(code, abs(left - right) <= tolerance, left, right, str(tolerance))
+        with localcontext() as context:
+            context.prec = 48
+            left = by_code[left_code].value
+            right = sum((by_code[c].value for c in right_codes), Decimal(0))
+            # Each displayed amount can round by half one original display unit.
+            tolerance = sum((Decimal(by_code[c].unit_scale) / 2 for c in required), Decimal(0))
+            return record(code, abs(left - right) <= tolerance, left, right, str(tolerance))
     checks.append(equation('balance_sheet_balance', 'total_assets',
                            ['total_liabilities', 'total_equity']))
     checks.append(equation('cashflow_reconciliation', 'cash_end',

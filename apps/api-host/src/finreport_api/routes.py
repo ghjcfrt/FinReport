@@ -49,6 +49,7 @@ from finance_adapters.persistence.models import (
     FilingVersion,
     FinancialFact,
     MetricResult,
+    OcrCall,
     TableCandidateRecord,
     ValidationResult,
 )
@@ -65,6 +66,7 @@ from finance_adapters.security.file_gate import scanned_object_path
 from finance_application.workflows.runtime import WorkflowRuntime
 from finance_domain.analysis.contracts import (
     ComparisonRequest,
+    ExtractionRequest,
     MetricRequest,
     ModelDiscoveryRequest,
     ModelSettingsUpdate,
@@ -73,10 +75,14 @@ from finance_domain.analysis.contracts import (
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
+from finreport_api.annual_disclosure_routes import router as annual_disclosure_router
 from finreport_api.comparison_routes import router as comparison_router
+from finreport_api.ocr_mapping_routes import router as ocr_mapping_router
 
 app = FastAPI(title="FinReport API", version="1.0.0")
 app.include_router(comparison_router)
+app.include_router(ocr_mapping_router)
+app.include_router(annual_disclosure_router)
 _recovery_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="extraction-recovery")
 _recovery_stop = Event()
 _recovery_thread: Thread | None = None
@@ -380,7 +386,9 @@ def create_job(
     filing_version_id: int,
     background: BackgroundTasks,
     session: Session = Depends(get_session),
+    payload: ExtractionRequest | None = None,
 ):
+    method = payload.extraction_method if payload else "pdf_text"
     filing = get_filing(session, filing_version_id)
     try:
         scanned_object_path(session, filing)
@@ -390,21 +398,52 @@ def create_job(
         select(ExtractionJob)
         .where(
             ExtractionJob.filing_version_id == filing.id,
-            ExtractionJob.status.in_(["queued", "running", "completed"]),
+            ExtractionJob.status.in_(["queued", "running"]),
         )
         .order_by(ExtractionJob.id.desc())
     )
     if existing:
+        if existing.extraction_method != method:
+            raise HTTPException(409, "EXTRACTION_METHOD_CONFLICT_WITH_ACTIVE_JOB")
         for recovered_id in recover_expired_extractions(session, existing.id):
             workflow_runtime.dispatch_extract(recovered_id, background)
         session.refresh(existing)
-        return envelope(request, {"job_id": existing.id, "status": existing.status, "reused": True})
-    job = ExtractionJob(filing_version_id=filing.id)
+        return envelope(request, {"job_id": existing.id, "status": existing.status, "reused": True,
+                                  "extraction_method": existing.extraction_method,
+                                  "review_required": True})
+    latest = session.scalar(select(ExtractionJob).where(
+        ExtractionJob.filing_version_id == filing.id,
+    ).order_by(ExtractionJob.id.desc()).limit(1))
+    if latest and latest.status == "completed" and latest.extraction_method == method:
+        return envelope(request, {"job_id": latest.id, "status": latest.status, "reused": True,
+                                  "extraction_method": latest.extraction_method,
+                                  "review_required": True})
+    job = ExtractionJob(filing_version_id=filing.id, extraction_method=method)
     queue_extraction(job)
     session.add(job)
+    filing.status = "extracting"
+    session.query(ValidationResult).filter(
+        ValidationResult.filing_version_id == filing.id,
+        ValidationResult.rule_code == "primary_statement_extraction",
+    ).delete()
+    session.add(ValidationResult(
+        filing_version_id=filing.id, rule_code="primary_statement_extraction", severity="fatal",
+        status="failed", actual_value="EXTRACTION_AND_HUMAN_REVIEW_PENDING",
+        expected_value="completed_extraction_and_current_fact_approvals",
+    ))
+    session.query(AnalysisRun).filter(AnalysisRun.filing_version_id == filing.id).update(
+        {AnalysisRun.invalidated_at: datetime.now(UTC), AnalysisRun.status: "invalidated"},
+        synchronize_session=False,
+    )
+    record_audit_event(
+        session, filing.id, category="workflow", action="extraction_method_selected",
+        status="queued", tool_name="extraction_lifecycle", tool_version="method-v1",
+        detail={"extraction_method": method, "review_required": True},
+    )
     session.commit()
     workflow_runtime.dispatch_extract(job.id, background)
-    return envelope(request, {"job_id": job.id, "status": job.status, "reused": False})
+    return envelope(request, {"job_id": job.id, "status": job.status, "reused": False,
+                              "extraction_method": job.extraction_method, "review_required": True})
 
 
 def _background_extract(job_id: int) -> None:
@@ -426,11 +465,22 @@ def get_job(request: Request, job_id: int, session: Session = Depends(get_sessio
         FinancialFact.filing_version_id == job.filing_version_id,
         FinancialFact.review_status == "needs_review",
     ))
+    if job.extraction_method == "ocr":
+        review_count = session.scalar(select(func.count()).select_from(TableCandidateRecord).join(
+            OcrCall, TableCandidateRecord.ocr_call_id == OcrCall.id,
+        ).where(
+            TableCandidateRecord.extraction_job_id == job.id,
+            TableCandidateRecord.review_required.is_(True),
+            OcrCall.status == "completed",
+            OcrCall.started_at >= job.started_at,
+        )) if job.started_at else 0
     return envelope(
         request,
         {
             "job_id": job.id,
             "filing_version_id": job.filing_version_id,
+            "extraction_method": job.extraction_method,
+            "review_required": True,
             "stage": job.stage,
             "status": job.status,
             "progress": job.progress,
@@ -447,11 +497,19 @@ def retry_job(request: Request, job_id: int, background: BackgroundTasks, sessio
     job = session.get(ExtractionJob, job_id)
     if job is None:
         raise HTTPException(404, "JOB_NOT_FOUND")
+    newer_job = session.scalar(select(ExtractionJob.id).where(
+        ExtractionJob.filing_version_id == job.filing_version_id,
+        ExtractionJob.id > job.id,
+    ).limit(1))
+    if newer_job is not None:
+        raise HTTPException(409, "EXTRACTION_JOB_SUPERSEDED")
     recovered = recover_expired_extractions(session, job.id)
     session.refresh(job)
     if recovered:
         workflow_runtime.dispatch_extract(job.id, background)
-        return envelope(request, {"job_id": job.id, "status": job.status, "reused": True})
+        return envelope(request, {"job_id": job.id, "status": job.status, "reused": True,
+                                  "extraction_method": job.extraction_method,
+                                  "review_required": True})
     if job.status != "failed" and not (job.status == "completed" and job.stage == "needs_review"):
         raise HTTPException(409, "JOB_NOT_RETRYABLE")
     try:
@@ -459,9 +517,25 @@ def retry_job(request: Request, job_id: int, background: BackgroundTasks, sessio
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
     queue_extraction(job)
+    filing = get_filing(session, job.filing_version_id)
+    filing.status = "extracting"
+    session.query(ValidationResult).filter(
+        ValidationResult.filing_version_id == filing.id,
+        ValidationResult.rule_code == "primary_statement_extraction",
+    ).delete()
+    session.add(ValidationResult(
+        filing_version_id=filing.id, rule_code="primary_statement_extraction", severity="fatal",
+        status="failed", actual_value="EXTRACTION_AND_HUMAN_REVIEW_PENDING",
+        expected_value="completed_extraction_and_current_fact_approvals",
+    ))
+    session.query(AnalysisRun).filter(AnalysisRun.filing_version_id == filing.id).update(
+        {AnalysisRun.invalidated_at: datetime.now(UTC), AnalysisRun.status: "invalidated"},
+        synchronize_session=False,
+    )
     session.commit()
     workflow_runtime.dispatch_extract(job.id, background)
-    return envelope(request, {"job_id": job.id, "status": job.status, "reused": True})
+    return envelope(request, {"job_id": job.id, "status": job.status, "reused": True,
+                              "extraction_method": job.extraction_method, "review_required": True})
 
 
 @app.post("/api/v1/jobs/{job_id}/cancel")
@@ -557,22 +631,34 @@ def list_tables(
 ):
     """Read complete candidate tables and measured visual indentation for review."""
     get_filing(session, filing_version_id)
-    latest_job_id = session.scalar(
-        select(ExtractionJob.id)
-        .join(TableCandidateRecord, TableCandidateRecord.extraction_job_id == ExtractionJob.id)
+    latest_job = session.scalar(
+        select(ExtractionJob)
         .where(ExtractionJob.filing_version_id == filing_version_id)
         .order_by(ExtractionJob.id.desc())
         .limit(1)
     )
-    if latest_job_id is None:
+    if latest_job is None:
         return envelope(request, [])
     query = select(TableCandidateRecord).where(
-        TableCandidateRecord.extraction_job_id == latest_job_id
+        TableCandidateRecord.extraction_job_id == latest_job.id
     )
+    ocr_calls = {}
+    if latest_job.extraction_method == "ocr":
+        if latest_job.status != "completed" or latest_job.started_at is None:
+            return envelope(request, [])
+        latest_calls = {}
+        for call in session.scalars(select(OcrCall).where(
+            OcrCall.extraction_job_id == latest_job.id,
+            OcrCall.started_at >= latest_job.started_at,
+        ).order_by(OcrCall.id)):
+            latest_calls[call.page_no] = call
+        ocr_calls = {call.id: call for call in latest_calls.values() if call.status == "completed"}
+        query = query.where(TableCandidateRecord.ocr_call_id.in_(ocr_calls))
     if page_no is not None:
         query = query.where(TableCandidateRecord.page_no == page_no)
     tables = []
     for candidate in session.scalars(query.order_by(TableCandidateRecord.page_no, TableCandidateRecord.id)):
+        ocr_call = ocr_calls.get(candidate.ocr_call_id)
         records = candidate.rows
         measured = bool(records) and isinstance(records[0], dict) and records[0].get("kind") == "header"
         if measured:
@@ -601,7 +687,10 @@ def list_tables(
                 "column_roles": header.get("column_roles", []),
                 "rows": rows,
                 "table_bbox": header.get("table_bbox"),
-                "page_sha256": header.get("page_sha256"),
+                "page_sha256": ocr_call.page_sha256 if ocr_call else header.get("page_sha256"),
+                "source_text": ocr_call.response_text if ocr_call else None,
+                "ocr_call_id": candidate.ocr_call_id,
+                "response_sha256": ocr_call.response_hash if ocr_call else None,
                 "layout_available": measured,
                 "extractor": candidate.extractor,
                 "confidence": candidate.confidence,
@@ -623,7 +712,19 @@ def review_fact(
     reviewer_id = payload.reviewer_id.strip()
     if not reviewer_id:
         raise HTTPException(422, "REVIEWER_REQUIRED")
+    # Reject stale OCR jobs before saving an approval. Re-map corrections on the
+    # page image so the original OCR observation and human correction stay linked.
+    from finance_adapters.persistence.mapping_gateway import MAPPING_VERSION, latest_ocr_job
+    try:
+        latest_ocr_job(session, session.get(FilingVersion, fact.filing_version_id), required=False)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
     if payload.decision == "corrected":
+        mapped = session.scalar(select(EvidenceFragment.id).where(
+            EvidenceFragment.fact_id == fact.id, EvidenceFragment.extractor == MAPPING_VERSION,
+        ))
+        if mapped is not None:
+            raise HTTPException(409, "OCR_CORRECTION_REQUIRES_IMAGE_MAPPING")
         if payload.corrected_value is None:
             raise HTTPException(422, "CORRECTED_VALUE_REQUIRED")
         new_fact = FinancialFact(

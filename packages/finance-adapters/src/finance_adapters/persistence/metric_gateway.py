@@ -5,10 +5,15 @@ import json
 import math
 import re
 from collections import defaultdict
-from decimal import Decimal
+from datetime import date
+from decimal import Decimal, localcontext
 
-from finance_domain.metrics.definitions import is_financial_industry
-from finance_domain.metrics.formulas import free_cash_flow
+from finance_domain.filings.concepts import validate_concept_metadata
+from finance_domain.metrics.definitions import (
+    METRIC_DEFINITIONS,
+    NON_FINANCIAL_METRICS,
+    industry_classification,
+)
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session, object_session
 
@@ -23,7 +28,7 @@ from finance_adapters.persistence.models import (
     ValidationResult,
 )
 
-FORMULA_VERSION = "general-non-financial-v2"
+FORMULA_VERSION = "general-non-financial-v4"
 
 
 def _related_records(session: Session, model, fact_ids: list[int], *ordering) -> dict:
@@ -37,10 +42,13 @@ def _related_records(session: Session, model, fact_ids: list[int], *ordering) ->
 
 
 def _snapshot_record(fact: FinancialFact, evidence, dimensions) -> dict:
+    with localcontext() as context:
+        context.prec = 48
+        normalized_value = str(Decimal(fact.value).quantize(Decimal("0.0001")))
     return {
         "id": fact.id,
         "code": fact.concept_code,
-        "value": str(Decimal(fact.value).quantize(Decimal("0.0001"))),
+        "value": normalized_value,
         "revision": fact.revision_no,
         "currency": fact.currency, "unit_scale": fact.unit_scale,
         "period_start": str(fact.period_start), "period_end": str(fact.period_end),
@@ -112,6 +120,9 @@ def require_supported_period(filing: FilingVersion) -> None:
 
 def require_source_assurance(session: Session, filing: FilingVersion) -> None:
     require_supported_period(filing)
+    from finance_adapters.persistence.mapping_gateway import validate_ocr_source_assurance
+
+    validate_ocr_source_assurance(session, filing)
     validations = list(session.scalars(select(ValidationResult).where(
         ValidationResult.filing_version_id == filing.id,
     )))
@@ -141,6 +152,8 @@ def current_verified_facts(session: Session, filing: FilingVersion) -> dict[str,
     evidence = _related_records(session, EvidenceFragment, ids, EvidenceFragment.id)
     reviews = _related_records(session, FactReview, ids)
     for fact in candidates:
+        if not validate_concept_metadata(fact.concept_code, fact.statement_type, fact.flow_or_stock):
+            raise ValueError("FACT_CONCEPT_METADATA_MISMATCH")
         scopes = [d.dimension_value for d in dimensions[fact.id] if d.dimension_name == "scope"]
         if not scopes or any(scope != filing.scope for scope in scopes):
             raise ValueError("FACT_SCOPE_MISMATCH")
@@ -175,16 +188,77 @@ def _snapshot(facts: dict[str, FinancialFact]) -> str:
         session = object_session(fact)
         evidence, dimensions = related[session] if session else ({}, {})
         value.append(_snapshot_record(fact, evidence.get(fact.id, []), dimensions.get(fact.id, [])))
-    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+    classifications = []
+    for session, ids in sessions.items():
+        filing_ids = {fact.filing_version_id for fact in facts.values() if object_session(fact) is session}
+        rows = session.execute(select(
+            FilingVersion.id, FilingVersion.company_id, Company.industry_code,
+            Company.industry_taxonomy_version,
+        ).outerjoin(Company, FilingVersion.company_id == Company.id)
+          .where(FilingVersion.id.in_(filing_ids)))
+        for filing_id, company_id, industry_code, taxonomy in rows:
+            classifications.append({"filing_id": filing_id, "company_id": company_id,
+                                    "industry_code": industry_code,
+                                    "industry_taxonomy_version": taxonomy})
+    payload = {"facts": value, "classification": sorted(classifications, key=lambda row: row["filing_id"])}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
 def current_metric_snapshot(session: Session, filing: FilingVersion) -> str:
     """Validate live audited inputs before displaying a persisted metric."""
     require_source_assurance(session, filing)
-    facts = current_verified_facts(session, filing)
+    facts = metric_facts(session, filing)
     if not facts:
         raise ValueError("STRICT_FACTS_REQUIRED")
     return _snapshot(facts)
+
+
+def verified_comparative_facts(
+    session: Session, filing: FilingVersion,
+) -> tuple[dict[str, FinancialFact], list[int]]:
+    """Admit same-report prior columns with the same evidence/review gate as comparison."""
+    from finance_adapters.persistence.review_gateway import _comparative_metadata_matches
+
+    prior, excluded, seen = {}, [], set()
+    prior_start, prior_end = date(filing.period_start.year - 1, 1, 1), date(filing.period_end.year - 1, 12, 31)
+    for fact in session.scalars(select(FinancialFact).where(
+        FinancialFact.filing_version_id == filing.id,
+        FinancialFact.comparative_period.is_(True),
+        FinancialFact.review_status != "superseded",
+        FinancialFact.quality_status != "superseded",
+    ).order_by(FinancialFact.id)):
+        if fact.concept_code in seen:
+            raise ValueError("AMBIGUOUS_COMPARATIVE_FACT")
+        seen.add(fact.concept_code)
+        dimensions = list(session.scalars(select(FactDimension).where(FactDimension.fact_id == fact.id)))
+        evidence = list(session.scalars(select(EvidenceFragment).where(EvidenceFragment.fact_id == fact.id)))
+        reviews = list(session.scalars(select(FactReview).where(FactReview.fact_id == fact.id)))
+        scopes = [item.dimension_value for item in dimensions if item.dimension_name == "scope"]
+        valid = (
+            fact.quality_status == "facts_verified" and fact.review_status == "verified"
+            and fact.period_start == prior_start and fact.period_end == prior_end
+            and fact.currency == "CNY" and fact.unit_scale in {1, 1000, 10000, 1000000, 100000000}
+            and Decimal(fact.value).is_finite() and fact.assurance_level == "audited_annual"
+            and bool(scopes) and all(scope == filing.scope for scope in scopes)
+            and has_current_approvals(fact, reviews, evidence, dimensions)
+            and _comparative_metadata_matches(fact, filing, evidence)
+            and validate_concept_metadata(fact.concept_code, fact.statement_type, fact.flow_or_stock)
+        )
+        if valid:
+            prior[fact.concept_code] = fact
+        else:
+            excluded.append(fact.id)
+    return prior, excluded
+
+
+def metric_facts(session: Session, filing: FilingVersion) -> dict[str, FinancialFact]:
+    """Keep actual prior periods intact; aliases identify formula input roles only."""
+    current = current_verified_facts(session, filing)
+    if not current:
+        return {}
+    prior, _ = verified_comparative_facts(session, filing)
+    needed = {code for definition in METRIC_DEFINITIONS.values() for code in definition.beginning_concepts}
+    return {**current, **{"beginning_" + code: fact for code, fact in prior.items() if code in needed}}
 
 
 def _result(
@@ -239,7 +313,7 @@ def calculate_metrics(session: Session, filing_id: int) -> list[MetricResult]:
     if filing is None or filing.status not in {"facts_verified", "metrics_ready", "analysis_ready"}:
         raise ValueError("STRICT_FACTS_REQUIRED")
     require_source_assurance(session, filing)
-    facts = current_verified_facts(session, filing)
+    facts = metric_facts(session, filing)
     if not facts:
         raise ValueError("STRICT_FACTS_REQUIRED")
     # Preserve historical values/IDs for audit bundles while preventing an old
@@ -249,143 +323,30 @@ def calculate_metrics(session: Session, filing_id: int) -> list[MetricResult]:
         MetricResult.formula_version != FORMULA_VERSION,
     ).values(applicability_status="superseded", quality_status="superseded"))
     company = session.get(Company, filing.company_id)
-    is_financial = bool(company and is_financial_industry(company.industry_code))
+    classification = industry_classification(company.industry_code if company else None)
     snapshot = _snapshot(facts)
     values: list[MetricResult] = []
-    direct = {
-        "revenue": ("营业收入", "currency"),
-        "operating_profit": ("营业利润", "currency"),
-        "net_income_attributable": ("归母净利润", "currency"),
-        "cashflow_operations": ("经营活动现金流净额", "currency"),
-    }
-    for code, (_, unit) in direct.items():
-        fact = facts.get(code)
-        values.append(
-            _result(
-                session,
-                filing_id,
-                code,
-                unit,
-                fact.value if fact else None,
-                "calculated" if fact else "not_available",
-                [fact.id] if fact else [],
-                snapshot if fact else None,
-            )
-        )
-
-    def ratio(code: str, numerator: str, denominator: str, unit: str = "ratio") -> None:
-        top, bottom = facts.get(numerator), facts.get(denominator)
-        if not top or not bottom:
-            values.append(
-                _result(
-                    session,
-                    filing_id,
-                    code,
-                    unit,
-                    None,
-                    "insufficient_data",
-                    [],
-                    None,
-                    "MISSING_INPUT",
-                )
-            )
-        elif bottom.value <= 0:
-            values.append(
-                _result(
-                    session,
-                    filing_id,
-                    code,
-                    unit,
-                    None,
-                    "insufficient_data",
-                    [top.id, bottom.id],
-                    snapshot,
-                    "NON_POSITIVE_DENOMINATOR",
-                )
-            )
+    for code, definition in METRIC_DEFINITIONS.items():
+        inputs = [facts.get(concept) for concept in definition.input_keys]
+        fact_ids = [fact.id for fact in inputs if fact is not None]
+        explanation = None
+        value = None
+        if code in NON_FINANCIAL_METRICS and classification != "non_financial":
+            status = "not_applicable" if classification == "financial" else "insufficient_data"
+            explanation = ("FINANCIAL_INDUSTRY_NOT_APPLICABLE" if classification == "financial"
+                           else "UNKNOWN_INDUSTRY_CLASSIFICATION")
+        elif any(fact is None for fact in inputs):
+            status = "not_available" if definition.operation == "identity" else "insufficient_data"
+            explanation = ("REVIEWED_BEGINNING_BALANCE_REQUIRED" if definition.beginning_concepts
+                           and any(facts.get("beginning_" + concept) is None for concept in definition.beginning_concepts)
+                           else "MISSING_INPUT")
         else:
-            values.append(
-                _result(
-                    session,
-                    filing_id,
-                    code,
-                    unit,
-                    top.value / bottom.value,
-                    "calculated",
-                    [top.id, bottom.id],
-                    snapshot,
-                )
-            )
-
-    revenue, cost = facts.get("revenue"), facts.get("operating_cost")
-    if is_financial:
-        values.append(_result(session, filing_id, "gross_margin", "ratio", None, "not_applicable", [], None, "FINANCIAL_INDUSTRY_NOT_APPLICABLE"))
-    elif revenue and cost and revenue.value > 0:
-        values.append(
-            _result(
-                session,
-                filing_id,
-                "gross_margin",
-                "ratio",
-                (revenue.value - cost.value) / revenue.value,
-                "calculated",
-                [revenue.id, cost.id],
-                snapshot,
-            )
-        )
-    else:
-        values.append(
-            _result(
-                session,
-                filing_id,
-                "gross_margin",
-                "ratio",
-                None,
-                "insufficient_data",
-                [],
-                None,
-                "MISSING_OR_NON_POSITIVE_REVENUE",
-            )
-        )
-    if is_financial:
-        values.append(_result(session, filing_id, "net_margin", "ratio", None, "not_applicable", [], None, "FINANCIAL_INDUSTRY_SPECIAL_REVENUE"))
-        values.append(_result(session, filing_id, "operating_cashflow_to_net_income", "ratio", None, "not_applicable", [], None, "FINANCIAL_INDUSTRY_SPECIAL_CASHFLOW"))
-    else:
-        ratio("net_margin", "net_income_attributable", "revenue")
-        ratio("operating_cashflow_to_net_income", "cashflow_operations", "net_income")
-    cfo, capex = facts.get("cashflow_operations"), facts.get("capex_cash")
-    if is_financial:
-        values.append(_result(session, filing_id, "free_cash_flow", "currency", None, "not_applicable", [], None, "FINANCIAL_INDUSTRY_NOT_APPLICABLE"))
-        session.commit()
-        return values
-    if cfo and capex:
-        fcf, issue = free_cash_flow(cfo.value, capex.value)
-        values.append(
-            _result(
-                session,
-                filing_id,
-                "free_cash_flow",
-                "currency",
-                fcf,
-                "insufficient_data" if issue else "calculated",
-                [cfo.id, capex.id],
-                snapshot,
-                issue or None,
-            )
-        )
-    else:
-        values.append(
-            _result(
-                session,
-                filing_id,
-                "free_cash_flow",
-                "currency",
-                None,
-                "not_available",
-                [],
-                None,
-                "MISSING_INPUT",
-            )
-        )
+            try:
+                value = definition.evaluate({key: Decimal(facts[key].value) for key in definition.input_keys})
+                status = "calculated"
+            except ValueError as exc:
+                status, explanation = "insufficient_data", str(exc)
+        values.append(_result(session, filing_id, code, definition.unit, value, status,
+                              fact_ids, snapshot, explanation))
     session.commit()
     return values

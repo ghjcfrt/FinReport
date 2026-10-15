@@ -1,0 +1,110 @@
+<Window x:Class="FinReport.Desktop.OcrMappingWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" xmlns:sys="clr-namespace:System;assembly=System.Runtime"
+    xmlns:controls="clr-namespace:FinReport.Desktop.Controls"
+    Title="OCR 候选表人工映射与来源核对" Width="1400" Height="930" MinWidth="1080" MinHeight="680"
+    WindowStartupLocation="CenterOwner" Background="#F4F7FB" FontFamily="Microsoft YaHei UI" FontSize="13">
+    <Window.Resources>
+        <Style TargetType="TextBox"><Setter Property="Padding" Value="6"/><Setter Property="Margin" Value="0,3,0,9"/></Style>
+        <Style TargetType="ComboBox"><Setter Property="MinHeight" Value="30"/><Setter Property="Margin" Value="0,3,0,9"/></Style>
+        <Style TargetType="Button"><Setter Property="Padding" Value="12,7"/><Setter Property="Margin" Value="0,0,8,5"/></Style>
+        <Style TargetType="TextBlock"><Setter Property="TextWrapping" Value="Wrap"/></Style>
+    </Window.Resources>
+    <Grid Margin="18">
+        <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+        <StackPanel Margin="0,0,0,12">
+            <TextBlock Text="{Binding TableSummary}" FontSize="17" FontWeight="SemiBold"/>
+            <TextBlock Margin="0,5,0,0" Text="建议顺序：核对并登记审计意见来源 → 映射所需科目 → 返回事实页双人审核 → 严格计算。来源或映射变更后须重新审核；框选使用本次 OCR 原图像素。"/>
+        </StackPanel>
+        <Grid Grid.Row="1">
+            <Grid.ColumnDefinitions><ColumnDefinition Width="*" MinWidth="450"/><ColumnDefinition Width="12"/><ColumnDefinition Width="470"/></Grid.ColumnDefinitions>
+            <Grid>
+                <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+                <StackPanel IsEnabled="{Binding IsAvailable}">
+                    <WrapPanel><TextBlock Text="原图页" Margin="0,8,8,0"/><ComboBox Width="250" ItemsSource="{Binding Pages}" SelectedItem="{Binding SelectedPage}" DisplayMemberPath="Display"/><Button Content="载入所选原图" Command="{Binding LoadPageCommand}" Margin="8,0,0,0"/></WrapPanel>
+                    <TextBlock Text="{Binding PageUseHint}" Foreground="#45576E"/>
+                    <WrapPanel Margin="0,7,0,0"><TextBlock Text="本次框选" Margin="0,8,8,0"/>
+                        <ComboBox x:Name="CaptureTargetSelector" Width="290" SelectedValue="{Binding CaptureTarget}" SelectedValuePath="Tag">
+                            <ComboBoxItem Content="金额（数值单元格）" Tag="value"/><ComboBoxItem Content="整行（科目与金额）" Tag="row"/>
+                            <ComboBoxItem Content="单位（单位文字）" Tag="unit"/><ComboBoxItem Content="审计意见（原文段落）" Tag="audit"/>
+                        </ComboBox>
+                    </WrapPanel>
+                </StackPanel>
+                <ScrollViewer x:Name="OcrImageScroll" Grid.Row="1" HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto" BorderBrush="#CBD5E1" BorderThickness="1" Background="White" Margin="0,2,0,8">
+                    <controls:OcrEvidenceImage x:Name="EvidenceImage" Source="{Binding PageImage}" IsEnabled="{Binding IsAvailable}"/>
+                </ScrollViewer>
+                <StackPanel Grid.Row="2"><TextBlock Text="{Binding SelectionSummary}" FontSize="11"/><TextBlock Text="{Binding PageFingerprint}" FontFamily="Consolas" FontSize="10" Foreground="#56667C" Margin="0,5,0,0"/></StackPanel>
+            </Grid>
+            <ScrollViewer Grid.Column="2" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Background="White" Padding="14">
+                <StackPanel IsEnabled="{Binding IsAvailable}">
+                    <TextBlock Text="登记人标识与核对说明（各类登记共用）" FontWeight="SemiBold"/>
+                    <TextBox Text="{Binding ReviewerId, UpdateSourceTrigger=PropertyChanged}" ToolTip="使用实际登记人标识"/>
+                    <TextBox Text="{Binding Reason, UpdateSourceTrigger=PropertyChanged}" AcceptsReturn="True" MinHeight="52" TextWrapping="Wrap" ToolTip="说明核对方法、OCR修正原因及口径依据"/>
+                    <TabControl>
+                        <TabItem Header="科目映射"><StackPanel Margin="8">
+                            <TextBlock Text="原始行"/><ComboBox x:Name="OcrRowSelector" ItemsSource="{Binding Rows}" SelectedItem="{Binding SelectedRow}" DisplayMemberPath="Display"/>
+                            <TextBlock Text="原始数值列（排除附注列）"/><ComboBox ItemsSource="{Binding Columns}" SelectedItem="{Binding SelectedColumn}" DisplayMemberPath="Display"/>
+                            <TextBlock Text="{Binding RawLabel}" FontWeight="SemiBold"/><TextBlock Text="原始 OCR 数值" Margin="0,6,0,0"/>
+                            <TextBox Text="{Binding RawValue, Mode=OneWay}" IsReadOnly="True"/>
+                            <TextBlock Text="人工修正原数（OCR有误时填写，保留原始值）"/><TextBox Text="{Binding CorrectedRawValue, UpdateSourceTrigger=PropertyChanged}"/>
+                            <TextBlock Text="标准科目"/><ComboBox ItemsSource="{Binding Concepts}" SelectedItem="{Binding SelectedConcept}" DisplayMemberPath="Display"/>
+                            <TextBlock Text="原文表名（须与科目所属合并报表一致）"/><TextBox Text="{Binding TableName, UpdateSourceTrigger=PropertyChanged}"/>
+                            <TextBlock Text="本次支持人民币、合并口径、中国企业会计准则。其他口径需专项适配，不作为当前严格指标输入。" FontSize="11" Foreground="#56667C" Margin="0,0,0,8"/>
+                            <TextBlock Text="原文单位文字（在左侧选择单位说明所在页，载入后框选；可跨页引用本次 OCR 证据）"/><TextBox Text="{Binding UnitText, UpdateSourceTrigger=PropertyChanged}"/>
+                            <ComboBox SelectedValue="{Binding UnitScale}" SelectedValuePath="Tag">
+                                <ComboBoxItem Content="元 × 1"><ComboBoxItem.Tag><sys:Int32>1</sys:Int32></ComboBoxItem.Tag></ComboBoxItem>
+                                <ComboBoxItem Content="千元 × 1000"><ComboBoxItem.Tag><sys:Int32>1000</sys:Int32></ComboBoxItem.Tag></ComboBoxItem>
+                                <ComboBoxItem Content="万元 × 10000"><ComboBoxItem.Tag><sys:Int32>10000</sys:Int32></ComboBoxItem.Tag></ComboBoxItem>
+                                <ComboBoxItem Content="百万元 × 1000000"><ComboBoxItem.Tag><sys:Int32>1000000</sys:Int32></ComboBoxItem.Tag></ComboBoxItem>
+                                <ComboBoxItem Content="亿元 × 100000000"><ComboBoxItem.Tag><sys:Int32>100000000</sys:Int32></ComboBoxItem.Tag></ComboBoxItem>
+                            </ComboBox>
+                            <TextBlock Text="期间与原始列名"/><ComboBox SelectedValue="{Binding PeriodRole}" SelectedValuePath="Tag"><ComboBoxItem Content="本期" Tag="current"/><ComboBoxItem Content="上年比较期" Tag="comparative"/></ComboBox>
+                            <TextBlock Text="{Binding ColumnLabel}"/>
+                            <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="12"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                                <TextBox Text="{Binding PeriodStart, UpdateSourceTrigger=PropertyChanged}" ToolTip="年度开始 YYYY-MM-DD"/><TextBox Grid.Column="2" Text="{Binding PeriodEnd, UpdateSourceTrigger=PropertyChanged}" ToolTip="年度结束 YYYY-MM-DD"/>
+                            </Grid>
+                            <TextBlock Text="资产负债表为期末存量，仍登记所在完整年度；期末日期须与原始列名一致。" FontSize="11" Foreground="#56667C"/>
+                            <CheckBox Content="比较期为重述或重列数据（须核对报告披露）" IsChecked="{Binding IsRestatement}" Margin="0,10"/>
+                            <Button x:Name="SaveOcrMappingButton" Content="登记为待审核候选事实" Command="{Binding SaveMappingCommand}"/>
+                        </StackPanel></TabItem>
+                        <TabItem Header="年度披露"><StackPanel Margin="8">
+                            <Button Content="加载年度披露定义" Command="{Binding LoadDisclosureDefinitionsCommand}"/>
+                            <TextBlock Text="披露指标"/><ComboBox ItemsSource="{Binding DisclosureDefinitions}" SelectedItem="{Binding SelectedDisclosureDefinition}" DisplayMemberPath="Display"/>
+                            <TextBlock Text="原始行"/><ComboBox ItemsSource="{Binding Rows}" SelectedItem="{Binding SelectedRow}" DisplayMemberPath="Display"/>
+                            <TextBlock Text="年度数值列"/><ComboBox ItemsSource="{Binding Columns}" SelectedItem="{Binding SelectedColumn}" DisplayMemberPath="Display"/>
+                            <TextBlock Text="{Binding RawLabel}" FontWeight="SemiBold"/><TextBlock Text="{Binding ColumnLabel}"/>
+                            <TextBlock Text="原始 OCR 数值" Margin="0,6,0,0"/><TextBox Text="{Binding RawValue, Mode=OneWay}" IsReadOnly="True"/>
+                            <TextBlock Text="人工修正原数（保留 OCR 原数）"/><TextBox Text="{Binding CorrectedRawValue, UpdateSourceTrigger=PropertyChanged}"/>
+                            <TextBlock Text="原文单位文字（左侧可选择本次 OCR 的其他页框选单位）"/><TextBox Text="{Binding UnitText, UpdateSourceTrigger=PropertyChanged}"/>
+                            <ComboBox SelectedValue="{Binding UnitScale}" SelectedValuePath="Tag">
+                                <ComboBoxItem Content="金额：元 × 1"><ComboBoxItem.Tag><sys:Int32>1</sys:Int32></ComboBoxItem.Tag></ComboBoxItem>
+                                <ComboBoxItem Content="金额：千元 × 1000"><ComboBoxItem.Tag><sys:Int32>1000</sys:Int32></ComboBoxItem.Tag></ComboBoxItem>
+                                <ComboBoxItem Content="金额：万元 × 10000"><ComboBoxItem.Tag><sys:Int32>10000</sys:Int32></ComboBoxItem.Tag></ComboBoxItem>
+                                <ComboBoxItem Content="金额：百万元 × 1000000"><ComboBoxItem.Tag><sys:Int32>1000000</sys:Int32></ComboBoxItem.Tag></ComboBoxItem>
+                                <ComboBoxItem Content="金额：亿元 × 100000000"><ComboBoxItem.Tag><sys:Int32>100000000</sys:Int32></ComboBoxItem.Tag></ComboBoxItem>
+                            </ComboBox>
+                            <TextBlock Text="每股收益按元/股；比例按带 % 的原数登记，两者不使用金额倍率。年度由原始列确定；暂支持人民币。披露指标经审核也不升级为经审计三表事实。" FontSize="11" Foreground="#56667C" Margin="0,0,0,10"/>
+                            <Button Content="登记为待审核年度披露" Command="{Binding SaveDisclosureMappingCommand}"/>
+                        </StackPanel></TabItem>
+                        <TabItem Header="审计意见来源"><StackPanel Margin="8">
+                            <TextBlock Text="选择审计报告所在页并载入原图，将框选类型改为“审计意见”，框选原文段落，再粘贴该页 OCR 的对应原句。仅支持当前年度合并财报标准无保留意见；非标准意见保持阻断。"/>
+                            <TextBox Text="{Binding AuditQuote, UpdateSourceTrigger=PropertyChanged}" AcceptsReturn="True" TextWrapping="Wrap" MinHeight="220" VerticalScrollBarVisibility="Auto" Margin="0,10,0,10"/>
+                            <Button Content="登记标准无保留审计意见证据" Command="{Binding ConfirmAuditCommand}"/>
+                        </StackPanel></TabItem>
+                    </TabControl>
+                    <Expander Header="该页 OCR 原始输出（可复制，非已核验事实）" Margin="0,12,0,0">
+                        <TextBox Text="{Binding SourceText, Mode=OneWay}" IsReadOnly="True" AcceptsReturn="True" TextWrapping="Wrap" Height="240" VerticalScrollBarVisibility="Auto" FontFamily="Consolas" FontSize="11"/>
+                    </Expander>
+                    <Border BorderBrush="#CBD5E1" BorderThickness="1" Padding="10" Margin="0,14,0,0" Background="#F4F7FB">
+                        <StackPanel>
+                            <TextBlock Text="完成本次来源替换" FontWeight="SemiBold"/>
+                            <TextBlock Text="所需主表科目与审计意见齐全后，显式归档未采用的旧方案事实，保留其证据和审批历史。当前 OCR 映射事实仍须双人审核；不会因完成映射而自动批准。" FontSize="11" Margin="0,6,0,10"/>
+                            <Button x:Name="CompleteOcrMappingButton" Content="完成映射并归档未采用的旧来源事实" Command="{Binding CompleteMappingCommand}"/>
+                        </StackPanel>
+                    </Border>
+                </StackPanel>
+            </ScrollViewer>
+        </Grid>
+        <StackPanel Grid.Row="2" Margin="0,12,0,0"><TextBlock Text="{Binding Status}"/><TextBlock Text="{Binding Error}" Foreground="#B42318" Margin="0,5,0,0"/></StackPanel>
+    </Grid>
+</Window>

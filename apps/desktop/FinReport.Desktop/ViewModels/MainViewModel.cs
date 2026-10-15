@@ -16,6 +16,8 @@ public partial class MainViewModel(FinReportApiClient api) : ObservableObject
     [ObservableProperty] private string stockCode = "";
     [ObservableProperty] private string companyName = "";
     [ObservableProperty] private int reportYear = 2025;
+    [ObservableProperty] private string selectedExtractionMethod = "pdf_text";
+    [ObservableProperty] private string? activeExtractionMethod;
     [ObservableProperty] private string statusMessage = "等待上传";
     [ObservableProperty] private string errorMessage = "";
     [ObservableProperty] private int progress;
@@ -64,11 +66,31 @@ public partial class MainViewModel(FinReportApiClient api) : ObservableObject
 
     public bool CanSubmit => !IsBusy && File.Exists(SelectedFilePath) && !string.IsNullOrWhiteSpace(StockCode) && !string.IsNullOrWhiteSpace(CompanyName) && ReportYear is >= 1900 and <= 2100;
 
+    public bool CanChooseExtractionMethod => !IsBusy;
+    public string ExtractionMethodHint => SelectedExtractionMethod == "ocr"
+        ? "OCR 生成候选表；请在原表页打开人工映射，框选原图并登记科目、单位与期间，再完成事实审核。"
+        : "直接提取 PDF 文字与位置证据，生成待审核事实；人工核对确认后才可严格计算与分析。";
+    public string ActiveExtractionSummary => ActiveExtractionMethod switch
+    {
+        "pdf_text" => "当前任务：方案1 · 直接 PDF 提取 → 人工审核",
+        "ocr" => "当前任务：方案2 · OCR 识别 → 人工审核",
+        null => "尚未开始任务；两种方案提取后均需人工审核。",
+        _ => $"当前任务：未知提取方案（{ActiveExtractionMethod}）；请核对任务信息。",
+    };
+
+    partial void OnActiveExtractionMethodChanged(string? value) => OnPropertyChanged(nameof(ActiveExtractionSummary));
+    partial void OnSelectedExtractionMethodChanged(string value) => OnPropertyChanged(nameof(ExtractionMethodHint));
+
     partial void OnSelectedFilePathChanged(string value) => OnPropertyChanged(nameof(CanSubmit));
     partial void OnStockCodeChanged(string value) => OnPropertyChanged(nameof(CanSubmit));
     partial void OnCompanyNameChanged(string value) => OnPropertyChanged(nameof(CanSubmit));
     partial void OnReportYearChanged(int value) => OnPropertyChanged(nameof(CanSubmit));
-    partial void OnIsBusyChanged(bool value) => OnPropertyChanged(nameof(CanSubmit));
+    partial void OnIsBusyChanged(bool value)
+    {
+        OnPropertyChanged(nameof(CanSubmit));
+        OnPropertyChanged(nameof(CanChooseExtractionMethod));
+        OnPropertyChanged(nameof(CanOpenOcrMapping));
+    }
 
     partial void OnSelectedTablePageChanged(int? value)
     {
@@ -233,11 +255,14 @@ public partial class MainViewModel(FinReportApiClient api) : ObservableObject
     private async Task UploadAsync()
     {
         if (!CanSubmit) return;
+        var extractionMethod = SelectedExtractionMethod;
+        ActiveExtractionMethod = extractionMethod;
         IsBusy = true;
         ErrorMessage = "";
         Progress = 0;
         CanStartAnalysis = false;
         Facts.Clear();
+        ClearAnnualDisclosures();
         _originalTables = [];
         OriginalTablePages.Clear();
         OriginalTables.Clear();
@@ -253,7 +278,7 @@ public partial class MainViewModel(FinReportApiClient api) : ObservableObject
             using var cancellation = BeginExtractionTracking();
             var filingId = await api.UploadAsync(SelectedFilePath, StockCode, CompanyName, ReportYear, cancellation.Token);
             _filingId = filingId;
-            var jobId = await api.StartJobAsync(filingId, cancellation.Token);
+            var jobId = await api.StartJobAsync(filingId, extractionMethod, cancellation.Token);
             _jobId = jobId;
             await TrackExtractionAsync(jobId, cancellation.Token);
         }
@@ -275,6 +300,7 @@ public partial class MainViewModel(FinReportApiClient api) : ObservableObject
         while (true)
         {
             var job = await api.GetJobAsync(jobId, cancellationToken);
+            if (!string.IsNullOrWhiteSpace(job.ExtractionMethod)) ActiveExtractionMethod = job.ExtractionMethod;
             Progress = job.Progress;
             StatusMessage = $"阶段：{job.Stage}；状态：{job.Status}；待复核：{job.ReviewCount}";
             if (job.Status is "completed" or "failed" or "cancelled")
@@ -283,7 +309,9 @@ public partial class MainViewModel(FinReportApiClient api) : ObservableObject
                 if (job.Status == "completed")
                 {
                     await RefreshFactsAsync(cancellationToken);
-                    StatusMessage = "解析完成，请逐项核对原文，由两名独立复核人确认后计算指标。";
+                    StatusMessage = ActiveExtractionMethod == "ocr"
+                        ? "OCR 识别完成。请在原表中打开人工映射，补齐原图定位证据、科目与期间，确认审计意见后，再逐条完成人工事实审核。"
+                        : "提取完成，需逐项核对原文并完成人工事实审核，才可计算指标与启动分析。";
                 }
                 await RefreshAuditTrailAsync(cancellationToken);
                 return;
@@ -382,6 +410,8 @@ public partial class MainViewModel(FinReportApiClient api) : ObservableObject
         decimal? corrected = null;
         if (decision == "corrected")
         {
+            if (SelectedFact.Fact.Extractor?.StartsWith("ocr", StringComparison.OrdinalIgnoreCase) == true)
+            { ErrorMessage = "OCR 事实请在原表的 OCR 映射窗口订正原数并重新双人复核；金额必须继续绑定原图证据。"; return; }
             if (!decimal.TryParse(CorrectedAmount, NumberStyles.Number, CultureInfo.InvariantCulture, out var amount))
             { ErrorMessage = "订正金额请填写人民币元。"; return; }
             corrected = amount;
@@ -519,6 +549,8 @@ public sealed class OriginalTableView
         + (Source.Confidence is decimal confidence ? $" · 提取置信度 {confidence:P0}" : "");
     public string SourceDetail => $"提取器：{Source.Extractor ?? "未记录"}；页指纹：{Source.PageSha256 ?? "未记录"}；"
         + $"原始表名：{Source.TableName ?? "未记录"}";
+    public Visibility OcrSourceVisibility => string.IsNullOrWhiteSpace(Source.SourceText)
+        ? Visibility.Collapsed : Visibility.Visible;
     public string FirstColumnHeading { get; }
     public string[] AdditionalColumnHeadings { get; }
     public OriginalTableRowView[] Rows { get; }

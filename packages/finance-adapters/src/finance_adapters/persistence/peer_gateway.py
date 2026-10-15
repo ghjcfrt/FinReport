@@ -12,7 +12,11 @@ from collections.abc import Callable
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation, localcontext
 
-from finance_domain.metrics.definitions import METRIC_DEFINITIONS, is_financial_industry
+from finance_domain.metrics.definitions import (
+    METRIC_DEFINITIONS,
+    NON_FINANCIAL_METRICS,
+    industry_classification,
+)
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -20,7 +24,7 @@ from .audit import stable_hash
 from .metric_gateway import (
     FORMULA_VERSION,
     _snapshot,
-    current_verified_facts,
+    metric_facts,
     require_source_assurance,
 )
 from .models import (
@@ -34,7 +38,7 @@ from .models import (
 )
 from .review_gateway import _located
 
-GATE_VERSION = "peer-gate-v1"
+GATE_VERSION = "peer-gate-v2"
 MINIMUM_COVERAGE = Decimal("0.80")
 HASH_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 TrustVerifier = Callable[[str, dict], bool]
@@ -154,7 +158,7 @@ def _qualified_member(
                                                      "superseding_filing_id": replacement.id})
     try:
         require_source_assurance(session, filing)
-        facts = current_verified_facts(session, filing)
+        facts = metric_facts(session, filing)
     except ValueError as exc:
         raise PeerGateError(str(exc), {"filing_id": filing.id}) from exc
     definition = METRIC_DEFINITIONS.get(metric_code)
@@ -163,10 +167,11 @@ def _qualified_member(
     company = session.get(Company, filing.company_id)
     if company is None:
         raise PeerGateError("PEER_COMPANY_NOT_FOUND")
-    if (is_financial_industry(company.industry_code)
-            and metric_code in {"gross_margin", "net_margin", "operating_cashflow_to_net_income",
-                                "free_cash_flow"}):
-        raise PeerGateError("PEER_METRIC_NOT_APPLICABLE")
+    if metric_code in NON_FINANCIAL_METRICS:
+        classification = industry_classification(company.industry_code)
+        if classification != "non_financial":
+            raise PeerGateError("PEER_METRIC_NOT_APPLICABLE" if classification == "financial"
+                                else "UNKNOWN_INDUSTRY_CLASSIFICATION")
     items = list(session.scalars(select(MetricResult).where(
         MetricResult.filing_version_id == filing.id, MetricResult.metric_code == metric_code,
         MetricResult.applicability_status == "calculated",
@@ -180,13 +185,13 @@ def _qualified_member(
         raise PeerGateError("PEER_METRIC_DIMENSIONS_MISMATCH", {"metric_id": item.id})
     if not facts or item.input_snapshot_hash != _snapshot(facts):
         raise PeerGateError("STALE_PEER_METRIC_SNAPSHOT", {"metric_id": item.id})
-    if any(code not in facts for code in definition.required_concepts):
+    if any(code not in facts for code in definition.input_keys):
         raise PeerGateError("PEER_METRIC_INPUTS_MISSING")
-    inputs = [facts[code] for code in definition.required_concepts]
+    inputs = [facts[code] for code in definition.input_keys]
     if set(item.input_fact_ids) != {fact.id for fact in inputs} or len(item.input_fact_ids) != len(inputs):
         raise PeerGateError("PEER_METRIC_INPUT_IDS_MISMATCH")
     evidence_snapshot = []
-    for fact in inputs:
+    for key, fact in zip(definition.input_keys, inputs, strict=True):
         evidence = list(session.scalars(select(EvidenceFragment).where(
             EvidenceFragment.fact_id == fact.id,
         ).order_by(EvidenceFragment.id)))
@@ -200,6 +205,8 @@ def _qualified_member(
             raise PeerGateError("PEER_VERIFIED_LOCATED_INPUTS_REQUIRED", {"fact_id": fact.id})
         evidence_snapshot.append({
             "fact_id": fact.id, "concept_code": fact.concept_code, "value": str(fact.value),
+            "input_key": key, "input_role": "beginning_balance" if key.startswith("beginning_") else "current_period",
+            "period_start": str(fact.period_start), "period_end": str(fact.period_end),
             "currency": fact.currency, "unit_scale": fact.unit_scale, "revision": fact.revision_no,
             "evidence": [{"id": entry.id, "page": entry.page_no, "page_sha256": entry.page_sha256,
                           "row": entry.row_locator, "column": entry.column_locator,
@@ -343,6 +350,36 @@ def _verified_approvals(records: list, snapshot_hash: str, verifier: TrustVerifi
         raise PeerGateError("TWO_DISTINCT_PEER_APPROVERS_REQUIRED")
 
 
+def _target_member(session: Session, target: Company, snapshot: dict, metric_code: str, cutoff: date) -> dict:
+    members = [member for member in snapshot["members"] if member["company_id"] == target.id]
+    if members:
+        return members[0]
+    dimensions = snapshot["members"][0]["dimensions"]
+    filings = list(session.scalars(select(FilingVersion).where(
+        FilingVersion.company_id == target.id,
+        FilingVersion.period_start == date.fromisoformat(dimensions["period_start"]),
+        FilingVersion.period_end == date.fromisoformat(dimensions["period_end"]),
+        FilingVersion.scope == dimensions["scope"],
+        FilingVersion.period_basis == dimensions["period_basis"],
+        FilingVersion.accounting_standard == dimensions["accounting_standard"],
+        FilingVersion.report_type == dimensions["report_type"],
+        FilingVersion.published_at <= cutoff,
+        FilingVersion.status.in_({"facts_verified", "metrics_ready", "analysis_ready"}),
+    )))
+    eligible, failures = [], []
+    for filing in filings:
+        if not filing.source_uri or not HASH_PATTERN.fullmatch(filing.file_sha256):
+            continue
+        try:
+            eligible.append(_qualified_member(session, filing, metric_code, data_cutoff=cutoff))
+        except PeerGateError as exc:
+            failures.append({"filing_id": filing.id, "code": exc.code})
+    if len(eligible) != 1:
+        raise PeerGateError("TARGET_COMPARABLE_METRIC_REQUIRED" if not eligible else "AMBIGUOUS_TARGET_FILING",
+                            {"eligible_filing_count": len(eligible), "excluded_filings": failures})
+    return eligible[0]
+
+
 def run_peer_comparison(
     session: Session, payload: dict, *, trust_verifier: TrustVerifier | None = None,
 ) -> dict:
@@ -388,14 +425,27 @@ def run_peer_comparison(
         _verified_approvals(records, stable_hash(snapshot), trust_verifier)
         if not trust_verifier("population", population):
             raise PeerGateError("UNTRUSTED_PEER_POPULATION_PROVENANCE")
+        target_member = _target_member(session, target, snapshot, metric_code, universe.data_cutoff)
+        frozen_input["target"] = target_member
         values = [Decimal(item["value"]) for item in snapshot["members"]]
         median = _median(values)
+        target_value = Decimal(target_member["value"])
         with localcontext() as context:
             context.prec = 64
             mad = _median([abs(value - median) for value in values])
+            delta = target_value - median
         output = {"sample_count": len(values), "coverage": snapshot["coverage"],
                   "population_issuer_count": len(snapshot["population"]["companies"]),
-                  "median": str(median), "mad": str(mad), "frozen_input": frozen_input}
+                  "median": str(median), "mad": str(mad), "frozen_input": frozen_input,
+                  "target_filing_id": target_member["filing_id"], "target_value": str(target_value),
+                  "target_minus_median": str(delta),
+                  "unit": METRIC_DEFINITIONS[metric_code].unit,
+                  "target_minus_median_unit": "ratio_points" if METRIC_DEFINITIONS[metric_code].unit == "ratio" else "CNY",
+                  "value_rank_descending": 1 + sum(value > target_value for value in values),
+                  "target_is_peer_member": any(member["company_id"] == target.id for member in snapshot["members"]),
+                  "rank_basis": "1 + peer_count_strictly_greater; ties share rank; numerical_order_only",
+                  "limitations": ["数值排序不代表财务表现优劣，不据此判断原因或投资价值。",
+                                  "行业码、期间及会计准则一致不保证主营结构、规模和收入确认经济口径完全一致。"]}
         status, failure, detail = "completed", None, {}
     except PeerGateError as exc:
         status, failure, detail = "not_comparable", exc.code, exc.detail

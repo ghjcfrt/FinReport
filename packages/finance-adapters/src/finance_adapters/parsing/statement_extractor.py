@@ -81,12 +81,13 @@ class StatementFact:
 def parse_number(value: str) -> Decimal | None:
     cleaned = re.sub(r"\s+", "", value).replace("，", ",")
     cleaned = cleaned.replace("（", "(").replace("）", ")").replace("−", "-")
-    if not re.fullmatch(r"\(?[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?\)?", cleaned):
+    number_pattern = r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
+    if not re.fullmatch(rf"(?:[+-]?{number_pattern}|\({number_pattern}\))", cleaned):
         return None
     negative = cleaned.startswith("(") and cleaned.endswith(")")
     try:
-        number = Decimal(cleaned.strip("()").replace(",", ""))
-        return -number if negative else number
+        number = Decimal((cleaned[1:-1] if negative else cleaned).replace(",", ""))
+        return number.copy_negate() if negative else number
     except InvalidOperation:
         return None
 

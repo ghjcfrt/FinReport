@@ -27,7 +27,10 @@ def init_database() -> None:
         "extraction_jobs": {
             "retry_count": "INTEGER DEFAULT 0", "queued_at": "DATETIME",
             "owner_token": "VARCHAR(64)", "lease_expires_at": "DATETIME",
+            "extraction_method": "VARCHAR(16) DEFAULT 'pdf_text'",
         },
+        "ocr_calls": {"response_text": "TEXT", "started_at": "DATETIME"},
+        "table_candidates": {"ocr_call_id": "INTEGER REFERENCES ocr_calls(id)"},
         "evidence_fragments": {"extractor": "VARCHAR(128) DEFAULT 'pymupdf-text-v1'"},
         "analysis_runs": {
             "orchestration_version": "VARCHAR(64) DEFAULT 'analysis-v1'",
@@ -52,7 +55,7 @@ def init_database() -> None:
             for name, definition in columns.items():
                 if name not in existing:
                     connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {definition}"))
-    for model in (models.FactDimension, models.EvidenceFragment):
+    for model in (models.FactDimension, models.EvidenceFragment, models.TableCandidateRecord):
         for index in model.__table__.indexes:
             index.create(engine, checkfirst=True)
 

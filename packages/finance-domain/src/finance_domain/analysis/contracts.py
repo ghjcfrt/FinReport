@@ -10,6 +10,71 @@ PositiveId = Annotated[int, Field(strict=True, gt=0)]
 NonBlankText = Annotated[str, Field(min_length=1)]
 
 
+class ExtractionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    extraction_method: Literal["pdf_text", "ocr"] = "pdf_text"
+
+
+ImageCoordinate = Annotated[float, Field(strict=True, allow_inf_nan=False)]
+ImageBox = Annotated[list[ImageCoordinate], Field(min_length=4, max_length=4)]
+
+
+class OcrFactMappingRequest(BaseModel):
+    """A human transcription from a located OCR table cell, never an approval."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    table_id: PositiveId
+    ocr_call_id: PositiveId
+    page_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    response_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    row_index: int = Field(ge=0, strict=True)
+    column_index: int = Field(ge=1, strict=True)
+    concept_code: str = Field(min_length=1, max_length=96)
+    raw_label: str = Field(min_length=1, max_length=256)
+    raw_value: str = Field(min_length=1, max_length=256)
+    corrected_raw_value: str | None = Field(default=None, min_length=1, max_length=256)
+    unit_scale: Literal[1, 1000, 10000, 1000000, 100000000]
+    currency: Literal["CNY"]
+    period_role: Literal["current", "comparative"]
+    period_start: date
+    period_end: date
+    scope: Literal["consolidated"]
+    accounting_standard: Literal["PRC_ASBE"]
+    is_restatement: StrictBool = False
+    table_name: str = Field(min_length=1, max_length=256)
+    column_label: str = Field(min_length=1, max_length=256)
+    value_bbox: ImageBox
+    row_bbox: ImageBox
+    unit_text: str = Field(min_length=1, max_length=256)
+    unit_bbox: ImageBox
+    unit_ocr_call_id: PositiveId | None = None
+    unit_page_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    unit_response_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    reviewer_id: str = Field(min_length=1, max_length=128)
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+class OcrAuditConfirmationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    ocr_call_id: PositiveId
+    page_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    response_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    quote: str = Field(min_length=20, max_length=12000)
+    bbox: ImageBox
+    opinion: Literal["standard_unqualified"]
+    reviewer_id: str = Field(min_length=1, max_length=128)
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+class OcrMappingCompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    job_id: PositiveId
+    file_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    reviewer_id: str = Field(min_length=1, max_length=128)
+    reason: str = Field(min_length=1, max_length=2000)
+
+
 class ReviewRequest(BaseModel):
     reviewer_id: str = Field(min_length=1, max_length=128)
     decision: Literal["confirmed", "corrected", "rejected"]

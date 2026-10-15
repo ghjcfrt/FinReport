@@ -43,6 +43,7 @@
                             <RowDefinition Height="Auto"/>
                             <RowDefinition Height="Auto"/>
                             <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
                         </Grid.RowDefinitions>
                         <StackPanel>
                             <TextBlock Style="{StaticResource SectionTitle}" Text="1. 添加财报"/>
@@ -58,7 +59,16 @@
                                 <TextBlock Text="{Binding SelectedFilePath}" TextTrimming="CharacterEllipsis" ToolTip="{Binding SelectedFilePath}" Foreground="{StaticResource MutedBrush}" VerticalAlignment="Center"/>
                             </Border>
                         </Grid>
-                        <Grid Grid.Row="2">
+                        <StackPanel Grid.Row="2" Margin="0,0,0,18">
+                            <TextBlock Style="{StaticResource FieldLabel}" Text="PDF 提取方案"/>
+                            <ComboBox x:Name="ExtractionMethodSelector" Style="{StaticResource InputCombo}" SelectedValue="{Binding SelectedExtractionMethod}" SelectedValuePath="Tag" IsEnabled="{Binding CanChooseExtractionMethod}">
+                                <ComboBoxItem Style="{StaticResource ComboItem}" Content="方案1：直接 PDF 提取" Tag="pdf_text"/>
+                                <ComboBoxItem Style="{StaticResource ComboItem}" Content="方案2：OCR 识别" Tag="ocr"/>
+                            </ComboBox>
+                            <TextBlock Style="{StaticResource FieldHint}" Text="方案1读取 PDF 文字与位置，适合含文字层的正规财报；方案2识别页面图像，适合扫描件。两种方案提取后均须人工审核，再计算指标与分析。" TextWrapping="Wrap"/>
+                            <TextBlock Style="{StaticResource FieldHint}" Text="{Binding ExtractionMethodHint}" TextWrapping="Wrap" Margin="0,5,0,0"/>
+                        </StackPanel>
+                        <Grid Grid.Row="3">
                             <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="20"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
                             <StackPanel>
                                 <TextBlock Style="{StaticResource FieldLabel}" Text="股票代码"/>
@@ -76,11 +86,12 @@
                 </Border>
                 <Border Grid.Column="1" Background="White" BorderBrush="{StaticResource LineBrush}" BorderThickness="1" CornerRadius="8" Padding="22">
                     <Grid>
-                        <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+                        <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
                         <TextBlock Style="{StaticResource SectionTitle}" Text="处理进度"/>
-                        <TextBlock Grid.Row="1" Margin="0,5,0,18" Text="{Binding StatusMessage}" Style="{StaticResource FieldHint}"/>
-                        <ProgressBar Grid.Row="2" Height="8" Minimum="0" Maximum="100" Value="{Binding Progress}" Foreground="{StaticResource BlueBrush}" Background="#E7EDF6" BorderThickness="0"/>
-                        <Grid Grid.Row="3" Margin="0,13,0,0">
+                        <TextBlock Grid.Row="1" Margin="0,10,0,6" Text="{Binding ActiveExtractionSummary}" FontSize="12" FontWeight="SemiBold" TextWrapping="Wrap"/>
+                        <TextBlock Grid.Row="2" Margin="0,5,0,18" Text="{Binding StatusMessage}" Style="{StaticResource FieldHint}" TextWrapping="Wrap"/>
+                        <ProgressBar Grid.Row="3" Height="8" Minimum="0" Maximum="100" Value="{Binding Progress}" Foreground="{StaticResource BlueBrush}" Background="#E7EDF6" BorderThickness="0"/>
+                        <Grid Grid.Row="4" Margin="0,13,0,0">
                             <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
                             <TextBlock Text="任务完成度" FontSize="12" Foreground="{StaticResource MutedBrush}"/>
                             <TextBlock Grid.Column="1" Text="{Binding Progress, StringFormat={}{0}%}" FontSize="12" FontWeight="SemiBold" Foreground="{StaticResource InkBrush}"/>
@@ -105,9 +116,16 @@
     <ComboBox Width="300" ItemsSource="{Binding OriginalTables}" SelectedItem="{Binding SelectedOriginalTable}" DisplayMemberPath="SelectionLabel" Margin="0,0,12,0"/>
     <Button Content="刷新原表" Command="{Binding RefreshOriginalTablesCommand}" Margin="0,0,10,0"/>
     <Button Content="打开原始 PDF" Command="{Binding OpenSourcePdfCommand}"/>
+    <Button x:Name="OpenOcrMappingButton" Content="OCR 人工映射与来源核对" Command="{Binding OpenOcrMappingCommand}" IsEnabled="{Binding CanOpenOcrMapping}" Margin="10,0,0,0"/>
 </WrapPanel>
 <TextBlock Text="{Binding OriginalTableSummary}" Foreground="{StaticResource MutedBrush}" TextWrapping="Wrap"/>
 <TextBlock Text="{Binding SelectedOriginalTable.Metadata}" Margin="0,6,0,8" FontWeight="SemiBold" ToolTip="{Binding SelectedOriginalTable.SourceDetail}"/>
+<Expander Header="OCR 原始输出与单位上下文（可复制）" Visibility="{Binding SelectedOriginalTable.OcrSourceVisibility}" Margin="0,0,0,12">
+    <StackPanel Margin="8">
+        <TextBlock Text="请人工核对原图中的表名、单位、年份和科目金额。OCR 输出是待审核候选，须映射或人工登记为带原文定位证据的事实，再完成人工审核，才能计算与分析。" TextWrapping="Wrap" Margin="0,0,0,8"/>
+        <TextBox x:Name="OcrSourceTextBox" Text="{Binding SelectedOriginalTable.Source.SourceText, Mode=OneWay}" IsReadOnly="True" AcceptsReturn="True" TextWrapping="Wrap" MaxHeight="300" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto" FontFamily="Cascadia Mono, Consolas"/>
+    </StackPanel>
+</Expander>
 <ScrollViewer MaxHeight="440" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto" BorderBrush="{StaticResource LineBrush}" BorderThickness="1" CanContentScroll="False">
     <StackPanel DataContext="{Binding SelectedOriginalTable}" MinWidth="780" Grid.IsSharedSizeScope="True">
         <Grid Background="#EEF3F9">
@@ -149,6 +167,17 @@
 <WrapPanel><TextBlock Text="复核人标识" VerticalAlignment="Center"/><TextBox Width="140" Margin="8,0,16,0" Text="{Binding ReviewerId, UpdateSourceTrigger=PropertyChanged}"/><TextBlock Text="核对说明" VerticalAlignment="Center"/><TextBox Width="260" Margin="8,0,16,0" Text="{Binding ReviewReason, UpdateSourceTrigger=PropertyChanged}"/><TextBlock Text="订正金额（元）" VerticalAlignment="Center"/><TextBox Width="160" Margin="8,0" Text="{Binding CorrectedAmount, UpdateSourceTrigger=PropertyChanged}"/></WrapPanel>
 <WrapPanel Margin="0,12,0,12"><Button Content="打开原始 PDF" Command="{Binding OpenSourcePdfCommand}" Margin="0,0,10,0"/><Button Content="确认所选事实" Command="{Binding ConfirmFactCommand}" Margin="0,0,10,0"/><Button Content="订正所选事实" Command="{Binding CorrectFactCommand}" Margin="0,0,10,0"/><Button Content="拒绝所选事实" Command="{Binding RejectFactCommand}" Margin="0,0,10,0"/><Button Content="刷新事实与校验" Command="{Binding RefreshFactsCommand}" Margin="0,0,10,0"/><Button Content="核验后计算指标" Command="{Binding CalculateMetricsCommand}"/></WrapPanel>
 <TextBlock Text="{Binding ValidationMessage}" TextWrapping="Wrap"/>
+</StackPanel></TabItem>
+<TabItem Header="年度披露指标"><StackPanel Margin="12">
+<TextBlock Text="扣非、公司披露 ROE/EPS、研发等指标按原文口径单独审核；不会自动当作审计三表数据，也不会用简单平均公式冒充加权披露值。" TextWrapping="Wrap"/>
+<WrapPanel Margin="0,10"><Button Content="刷新年度披露指标" Command="{Binding RefreshAnnualDisclosuresCommand}" Margin="0,0,10,0"/><Button Content="从当前 PDF 补提取年度披露" Command="{Binding ExtractAnnualDisclosuresCommand}" Margin="0,0,10,0"/><Button Content="打开原始 PDF" Command="{Binding OpenSourcePdfCommand}"/></WrapPanel>
+<TextBlock Text="{Binding AnnualDisclosureSummary}" TextWrapping="Wrap"/>
+<DataGrid Height="280" ItemsSource="{Binding AnnualDisclosures}" SelectedItem="{Binding SelectedAnnualDisclosure}" IsReadOnly="True" AutoGenerateColumns="False" Margin="0,10">
+<DataGrid.Columns><DataGridTextColumn Header="披露指标" Binding="{Binding Name}" Width="200"/><DataGridTextColumn Header="值及单位" Binding="{Binding ValueDisplay}" Width="160"/><DataGridTextColumn Header="期间" Binding="{Binding PeriodDisplay}" Width="200"/><DataGridTextColumn Header="原文位置与原数" Binding="{Binding SourceDisplay}" Width="*"/><DataGridTextColumn Header="审核" Binding="{Binding ReviewDisplay}" Width="140"/></DataGrid.Columns>
+</DataGrid>
+<WrapPanel><TextBlock Text="复核人标识" VerticalAlignment="Center"/><TextBox Width="140" Margin="8,0,16,0" Text="{Binding ReviewerId, UpdateSourceTrigger=PropertyChanged}"/><TextBlock Text="核对说明" VerticalAlignment="Center"/><TextBox Width="260" Margin="8,0,16,0" Text="{Binding ReviewReason, UpdateSourceTrigger=PropertyChanged}"/><Button Content="确认所选披露" Command="{Binding ConfirmAnnualDisclosureCommand}" Margin="0,0,10,0"/><Button Content="拒绝所选披露" Command="{Binding RejectAnnualDisclosureCommand}"/></WrapPanel>
+<Expander Header="所选披露原文证据" Margin="0,10"><TextBox Text="{Binding SelectedAnnualDisclosure.EvidenceDisplay, Mode=OneWay}" IsReadOnly="True" MaxHeight="220" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"/></Expander>
+<Expander Header="同比与比例核算"><TextBox Text="{Binding AnnualDisclosureComparisons, Mode=OneWay}" IsReadOnly="True" MaxHeight="260" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"/></Expander>
 </StackPanel></TabItem>
 </TabControl></Expander>
 <TextBlock Margin="0,4,0,0" Text="{Binding MetricsSummary}" Foreground="{StaticResource MutedBrush}" TextWrapping="Wrap"/><Expander Header="分析结果" Margin="0,10"><TextBox Text="{Binding AnalysisSummary, Mode=OneWay}" IsReadOnly="True" TextWrapping="Wrap" MaxHeight="400" VerticalScrollBarVisibility="Auto"/></Expander><TextBlock Margin="0,4,0,0" Text="{Binding ExportSummary}" Foreground="{StaticResource MutedBrush}" TextWrapping="Wrap"/></StackPanel></Border></Grid>
