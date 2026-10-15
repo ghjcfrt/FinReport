@@ -4,7 +4,10 @@ from datetime import date
 from decimal import Decimal
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
+
+PositiveId = Annotated[int, Field(strict=True, gt=0)]
+NonBlankText = Annotated[str, Field(min_length=1)]
 
 
 class ReviewRequest(BaseModel):
@@ -22,13 +25,22 @@ class MetricObservation(BaseModel):
     """Model-selected metric facts; numerical prose is rendered by the server."""
 
     model_config = ConfigDict(extra="forbid")
-    metric_result_id: int
+    metric_result_id: PositiveId
     value: Decimal = Field(allow_inf_nan=False)
     unit: Literal["currency", "ratio"]
     scope: Literal["consolidated", "parent"]
     period_start: date
     period_end: date
-    input_fact_ids: list[int]
+    input_fact_ids: list[PositiveId] = Field(min_length=1)
+    # Computable statements are selected structurally and evaluated by the server.
+    predicate: Literal["positive", "negative", "zero", "nonnegative", "nonpositive"] | None = None
+
+    @field_validator("input_fact_ids")
+    @classmethod
+    def unique_inputs(cls, value: list[int]) -> list[int]:
+        if len(value) != len(set(value)):
+            raise ValueError("DUPLICATE_FACT_REFERENCE")
+        return value
 
 
 class AnalysisScope(BaseModel):
@@ -39,6 +51,14 @@ class AnalysisScope(BaseModel):
     scope: Literal["consolidated", "parent"]
     period_basis: Literal["annual", "semi_annual"]
     currency: str
+
+
+class SourceAssertion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_id: str = Field(min_length=1)
+    quote: str = Field(min_length=1)
+    selected_answer: str | None = None
 
 
 class Claim(BaseModel):
@@ -52,13 +72,28 @@ class Claim(BaseModel):
         "review_required_hypothesis",
     ]
     content: str
-    scope: str
+    scope: Literal["consolidated", "parent"]
     rationale: str
-    metric_result_ids: list[int]
-    evidence_fragment_ids: list[int]
+    metric_result_ids: list[PositiveId] = Field(min_length=1)
+    evidence_fragment_ids: list[PositiveId] = Field(min_length=1)
     evidence_relation: Literal["direct", "inferred"]
-    review_required: bool
-    observations: list[MetricObservation] = Field(default_factory=list)
+    review_required: StrictBool
+    observations: list[MetricObservation] = Field(min_length=1)
+    source_assertions: list[SourceAssertion] = Field(default_factory=list)
+
+    @field_validator("metric_result_ids", "evidence_fragment_ids")
+    @classmethod
+    def unique_references(cls, value: list[int]) -> list[int]:
+        if len(value) != len(set(value)):
+            raise ValueError("DUPLICATE_REFERENCE")
+        return value
+
+    @field_validator("type")
+    @classmethod
+    def nonblank_type(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("NONBLANK_CLAIM_TYPE_REQUIRED")
+        return value
 
 
 class AnalysisOutput(BaseModel):
@@ -69,8 +104,22 @@ class AnalysisOutput(BaseModel):
     qualitative_summary: str
     overall_review_required: Literal[True]
     claims: list[Claim]
-    limitations: list[str]
-    report_sections: list[Annotated[str, Field(min_length=1)]] = Field(min_length=1)
+    limitations: list[NonBlankText]
+    report_sections: list[NonBlankText] = Field(min_length=1)
+
+    @field_validator("overall_review_required", mode="before")
+    @classmethod
+    def review_flag_is_boolean(cls, value):
+        if value is not True:
+            raise ValueError("OVERALL_REVIEW_REQUIRED_MUST_BE_TRUE_BOOLEAN")
+        return value
+
+    @field_validator("limitations", "report_sections")
+    @classmethod
+    def nonblank_items(cls, value: list[str]) -> list[str]:
+        if any(not item.strip() for item in value):
+            raise ValueError("NONBLANK_TEXT_REQUIRED")
+        return value
 
 
 class ComparisonRequest(BaseModel):

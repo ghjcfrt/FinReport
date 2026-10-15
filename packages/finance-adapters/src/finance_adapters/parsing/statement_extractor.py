@@ -6,12 +6,54 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from html.parser import HTMLParser
 from itertools import pairwise
+from statistics import median
 
 
 @dataclass(frozen=True)
 class TextCell:
     text: str
     bbox: tuple[float, float, float, float]
+    characters: tuple[tuple[str, tuple[float, float, float, float]], ...] = ()
+    font_size: float = 0.0
+    coordinate_source: str = "pdf_span_bbox_fallback"
+
+
+@dataclass(frozen=True)
+class LabelLayout:
+    """Printed geometry only: an indentation level is not an accounting parent."""
+
+    page_no: int
+    table_name: str
+    source: str
+    table_origin_x: float
+    label_bbox: tuple[float, float, float, float]
+    label_start_x: float
+    body_start_x: float
+    prefix: str
+    indent_points: float
+    indent_level: int
+    font_size: float
+
+
+@dataclass(frozen=True)
+class StatementTableRow:
+    row_index: int
+    cells: tuple[str, ...]
+    raw_label: str
+    row_bbox: tuple[float, float, float, float]
+    label_layout: LabelLayout
+
+
+@dataclass(frozen=True)
+class StatementTable:
+    page_no: int
+    table_name: str
+    statement_type: str
+    headers: tuple[str, ...]
+    column_roles: tuple[str, ...]
+    table_bbox: tuple[float, float, float, float]
+    rows: tuple[StatementTableRow, ...]
+    page_sha256: str
 
 
 @dataclass(frozen=True)
@@ -33,6 +75,7 @@ class StatementFact:
     page_sha256: str
     unit_page_no: int | None = None
     unit_text: str | None = None
+    label_layout: LabelLayout | None = None
 
 
 def parse_number(value: str) -> Decimal | None:
@@ -60,13 +103,36 @@ def normalized_label(text: str) -> str:
 
 
 def page_rows(page) -> list[list[TextCell]]:
-    cells = [
-        TextCell(span["text"], tuple(span["bbox"]))
-        for block in page.get_text("dict")["blocks"]
-        for line in block.get("lines", [])
-        for span in line["spans"]
-        if span["text"].strip()
-    ]
+    try:
+        content = page.get_text("rawdict")
+    except (AttributeError, KeyError, NotImplementedError, TypeError, ValueError):
+        content = page.get_text("dict")
+    if not isinstance(content, dict) or "blocks" not in content:
+        content = page.get_text("dict")
+    cells = []
+    for block in content["blocks"]:
+        for line in block.get("lines", []):
+            for span in line["spans"]:
+                chars = span.get("chars", [])
+                text = "".join(char["c"] for char in chars) if chars else span.get("text", "")
+                if not text.strip():
+                    continue
+                visible = [char for char in chars if not char["c"].isspace()]
+                bbox = (
+                    (
+                        min(char["bbox"][0] for char in visible),
+                        min(char["bbox"][1] for char in visible),
+                        max(char["bbox"][2] for char in visible),
+                        max(char["bbox"][3] for char in visible),
+                    )
+                    if visible else tuple(span["bbox"])
+                )
+                cells.append(TextCell(
+                    text, bbox,
+                    tuple((char["c"], tuple(char["bbox"])) for char in chars),
+                    float(span.get("size", bbox[3] - bbox[1])),
+                    "pdf_text_geometry" if visible else "pdf_span_bbox_fallback",
+                ))
     rows: list[list[TextCell]] = []
     for cell in sorted(cells, key=lambda item: (item.bbox[1], item.bbox[0])):
         center = (cell.bbox[1] + cell.bbox[3]) / 2
@@ -84,6 +150,179 @@ def union_bbox(cells: list[TextCell]) -> tuple[float, float, float, float]:
         max(cell.bbox[2] for cell in cells),
         max(cell.bbox[3] for cell in cells),
     )
+
+
+def _raw_label(cells: list[TextCell]) -> str:
+    lines: list[list[TextCell]] = []
+    for cell in sorted(cells, key=lambda item: (item.bbox[1], item.bbox[0])):
+        if lines and abs(cell.bbox[1] - lines[-1][0].bbox[1]) <= 3:
+            lines[-1].append(cell)
+        else:
+            lines.append([cell])
+    return "\n".join("".join(cell.text for cell in line).strip() for line in lines)
+
+
+def _font_size(cells: list[TextCell]) -> float:
+    sizes = [cell.font_size for cell in cells if cell.font_size > 0]
+    return median(sizes) if sizes else 0.0
+
+
+def _label_layout(
+    cells: list[TextCell], page_no: int, table_name: str,
+    origin_x: float, band_centers: list[float],
+) -> LabelLayout:
+    label = compact(_raw_label(cells))
+    match = re.match(r"^(?:[一二三四五六七八九十百\d]+[、.．:：]|(?:加|减|其中)[:：])", label)
+    prefix = match[0] if match else ""
+    ordered = sorted(cells, key=lambda cell: (cell.bbox[1], cell.bbox[0]))
+    visible = [(char, bbox) for cell in ordered for char, bbox in cell.characters
+               if not char.isspace()]
+    bbox = union_bbox(cells)
+    # Dict-only page adapters cannot establish a within-span character position.
+    # Preserve their coarse geometry and identify it explicitly instead of guessing.
+    body_x = visible[len(prefix)][1][0] if len(visible) > len(prefix) else bbox[0]
+    if not visible and prefix:
+        remaining = len(prefix)
+        for cell in ordered:
+            length = len(compact(cell.text))
+            if remaining < length:
+                body_x = cell.bbox[0]
+                break
+            remaining -= length
+    return LabelLayout(
+        page_no, table_name,
+        "pdf_text_geometry" if all(cell.coordinate_source == "pdf_text_geometry"
+                                    for cell in cells) else "pdf_span_bbox_fallback",
+        origin_x, bbox, bbox[0], body_x, prefix, max(0.0, bbox[0] - origin_x),
+        min(range(len(band_centers)), key=lambda i: abs(band_centers[i] - bbox[0])),
+        _font_size(cells),
+    )
+
+
+def _statement_table(
+    rows: list[list[TextCell]], header_row: list[TextCell], years: list[TextCell],
+    page_no: int, table_name: str, statement_type: str, page_hash: str,
+) -> StatementTable:
+    years = sorted(years, key=lambda cell: cell.bbox[0])
+    centers = [(cell.bbox[0] + cell.bbox[2]) / 2 for cell in years]
+    separation = min(right - left for left, right in pairwise(centers))
+    boundaries = [centers[0] - separation / 2,
+                  *((left + right) / 2 for left, right in pairwise(centers)),
+                  centers[-1] + separation / 2]
+    notes = next((cell for cell in header_row if "附注" in cell.text
+                  and cell.bbox[0] < boundaries[0]), None)
+    label_right = notes.bbox[0] if notes else boundaries[0]
+    label_header = "".join(cell.text for cell in header_row
+                           if cell.bbox[0] < label_right and cell not in years).strip()
+    headers = [label_header] + ([notes.text.strip()] if notes else [])
+    headers.extend(cell.text.strip() for cell in years)
+    roles = ["label"] + (["notes"] if notes else [])
+    roles.extend("year:" + compact(cell.text)[:4] for cell in years)
+    header_cells = list(header_row)
+    header_top = min(cell.bbox[1] for cell in header_row)
+    header_bottom = max(cell.bbox[3] for cell in header_row)
+    for row in rows:
+        if not (header_top < row[0].bbox[1] <= header_bottom + 25):
+            continue
+        for cell in row:
+            if "重述" not in cell.text and "重列" not in cell.text:
+                continue
+            center = (cell.bbox[0] + cell.bbox[2]) / 2
+            for index in range(len(years)):
+                if boundaries[index] <= center < boundaries[index + 1]:
+                    headers[1 + bool(notes) + index] += "\n" + cell.text.strip()
+                    header_cells.append(cell)
+    numeric_baselines = [
+        (row[0].bbox[1] + row[0].bbox[3]) / 2 for row in rows
+        if row[0].bbox[1] > header_bottom and any(
+            boundaries[0] <= (cell.bbox[0] + cell.bbox[2]) / 2 < boundaries[-1]
+            and parse_number(cell.text) is not None for cell in row
+        )
+    ]
+    numeric_gaps = [right - left for left, right in pairwise(numeric_baselines) if right > left]
+    numeric_line_gap = 0.0
+    # Sparse tables do not establish normal row spacing: a short next label may
+    # be the first child of a category rather than the end of a wrapped label.
+    if len(numeric_gaps) >= 3:
+        typical_gap = median(numeric_gaps)
+        stable_gaps = [gap for gap in numeric_gaps if abs(gap - typical_gap) <= 1.0]
+        if len(stable_gaps) >= 3:
+            numeric_line_gap = median(stable_gaps)
+    drafts: list[tuple[list[TextCell], list[TextCell]]] = []
+    for row in rows:
+        if row[0].bbox[1] <= header_top + 5:
+            continue
+        row_text = "".join(cell.text for cell in row)
+        if re.search(r"后附财务报表附注|法定代表人|主管会计工作负责人|会计机构负责人", row_text):
+            break
+        if any(cell in header_cells for cell in row) or declared_scale(row_text) is not None:
+            continue
+        labels = [cell for cell in row if cell.bbox[0] < label_right
+                  and parse_number(cell.text) is None]
+        data = [cell for cell in row if cell not in labels and cell.bbox[0] >= label_right]
+        if not labels:
+            if drafts and data and not drafts[-1][1]:
+                previous = drafts[-1][0]
+                if row[0].bbox[1] - union_bbox(previous)[3] <= max(7, _font_size(previous)):
+                    drafts[-1][1].extend(data)
+            continue
+        if drafts and not drafts[-1][1]:
+            previous = drafts[-1][0]
+            font_size = _font_size(previous + labels)
+            tolerance = max(1.0, font_size * 0.1)
+            previous_box, current_box = union_bbox(previous), union_bbox(labels)
+            previous_text = compact(_raw_label(previous))
+            at_column_edge = previous_box[2] >= label_right - max(2, font_size * 2)
+            tight_line_spacing = (
+                numeric_line_gap > 0
+                and current_box[1] - previous_box[1] <= numeric_line_gap * 0.6
+                and previous_box[2] - previous_box[0] >= (label_right - previous_box[0]) / 2
+                and current_box[2] - current_box[0]
+                >= (previous_box[2] - previous_box[0]) * 0.4
+                and len(previous_text) > len(compact(_raw_label(labels)))
+            )
+            if (
+                abs(previous_box[0] - current_box[0]) <= tolerance
+                and current_box[1] - previous_box[3] <= max(7, font_size * 0.8)
+                and not re.match(r"^[一二三四五六七八九十百\d]+[、.．:：]", previous_text)
+                and not previous_text.endswith(("：", ":"))
+                and (at_column_edge or tight_line_spacing)
+            ):
+                previous.extend(labels)
+                drafts[-1][1].extend(data)
+                continue
+        drafts.append((list(labels), list(data)))
+    if not drafts:
+        return StatementTable(page_no, table_name, statement_type, tuple(headers), tuple(roles),
+                              union_bbox(header_cells), (), page_hash)
+    origin_x = min(union_bbox(labels)[0] for labels, _ in drafts)
+    tolerance = max(1.0, _font_size([cell for labels, _ in drafts for cell in labels]) * 0.1)
+    bands: list[list[float]] = []
+    for x in sorted(union_bbox(labels)[0] for labels, _ in drafts):
+        if bands and x - sum(bands[-1]) / len(bands[-1]) <= tolerance:
+            bands[-1].append(x)
+        else:
+            bands.append([x])
+    band_centers = [sum(band) / len(band) for band in bands]
+    table_rows = []
+    all_cells = list(header_cells)
+    for index, (labels, data) in enumerate(drafts):
+        raw_label = _raw_label(labels)
+        values = [raw_label.replace("\n", "")]
+        if notes:
+            values.append("".join(cell.text for cell in data
+                                  if cell.bbox[0] < boundaries[0]).strip())
+        for column in range(len(years)):
+            values.append("".join(cell.text for cell in data
+                                  if boundaries[column] <= (cell.bbox[0] + cell.bbox[2]) / 2
+                                  < boundaries[column + 1]).strip())
+        table_rows.append(StatementTableRow(
+            index, tuple(values), raw_label, union_bbox(labels + data),
+            _label_layout(labels, page_no, table_name, origin_x, band_centers),
+        ))
+        all_cells.extend(labels + data)
+    return StatementTable(page_no, table_name, statement_type, tuple(headers), tuple(roles),
+                          union_bbox(all_cells), tuple(table_rows), page_hash)
 
 
 def declared_scale(text: str) -> int | None:
@@ -130,14 +369,17 @@ class StatementExtractor:
         self.table_name: str | None = None
         self.last_page = 0
         self.facts: dict[str, StatementFact] = {}
+        self.tables: dict[int, StatementTable] = {}
         self.issues: list[str] = []
         self.statement_pages: list[int] = []
         self.unit_page_no: int | None = None
         self.unit_text: str | None = None
 
-    def add_page(self, page, page_no: int, page_hash: str) -> list[StatementFact]:
+    def add_page(
+        self, page, page_no: int, page_hash: str, *, native_text: str | None = None,
+    ) -> list[StatementFact]:
         rows = page_rows(page)
-        text = page.get_text("text")
+        text = page.get_text("text") if native_text is None else native_text
         titles = []
         for row in rows:
             label = compact("".join(cell.text for cell in row))
@@ -194,6 +436,12 @@ class StatementExtractor:
             if titles:
                 self.issues.append(f"page:{page_no}:CURRENT_PERIOD_COLUMN_UNCONFIRMED")
             return []
+        header_row, years, target = header
+        table = _statement_table(
+            rows, header_row, years, page_no, self.table_name, self.statement, page_hash,
+        )
+        self.tables[page_no] = table
+        label_layouts = {row.label_layout.label_bbox: row.label_layout for row in table.rows}
         scale = declared_scale(text)
         if scale is not None:
             self.scale = scale
@@ -207,7 +455,6 @@ class StatementExtractor:
         if self.scale is None or self.currency is None:
             self.issues.append(f"page:{page_no}:CURRENCY_OR_UNIT_UNCONFIRMED")
             return []
-        header_row, years, target = header
         target_label = compact(target.text)
         date_match = re.fullmatch(r"(20\d{2})年(\d{1,2})月(\d{1,2})日", target_label)
         if date_match and self.expected_period_end is not None:
@@ -241,8 +488,11 @@ class StatementExtractor:
             if not (header_row[0].bbox[1] < row[0].bbox[1] <= header_row[0].bbox[3] + 25):
                 continue
             for cell in row:
-                if "重述" in cell.text and not left <= (cell.bbox[0] + cell.bbox[2]) / 2 < right:
-                    column_label += "；比较列经重述"
+                if ("重述" in cell.text or "重列" in cell.text) and not (
+                    left <= (cell.bbox[0] + cell.bbox[2]) / 2 < right
+                ):
+                    marker = "重述" if "重述" in cell.text else "重列"
+                    column_label += f"；比较列经{marker}"
         self.statement_pages.append(page_no)
         new_facts = []
         pending_label: list[TextCell] = []
@@ -303,6 +553,7 @@ class StatementExtractor:
                 page_hash,
                 self.unit_page_no,
                 self.unit_text,
+                label_layouts.get(union_bbox(label_cells)),
             )
             old = self.facts.get(code)
             if old:

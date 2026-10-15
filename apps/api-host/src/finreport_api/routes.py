@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import hashlib
-import json
-import statistics
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime
-from decimal import Decimal
 from pathlib import Path
+from threading import Event, Thread
 
 from fastapi import (
     BackgroundTasks,
@@ -26,7 +25,16 @@ from finance_adapters.exports.report_renderer import generate_export
 from finance_adapters.parsing.pdf_parser import run_extraction
 from finance_adapters.persistence.audit import record_audit_event, stable_hash
 from finance_adapters.persistence.database import get_session, init_database
-from finance_adapters.persistence.metric_gateway import calculate_metrics
+from finance_adapters.persistence.extraction_lifecycle import (
+    queue_extraction,
+    recover_expired_extractions,
+)
+from finance_adapters.persistence.metric_gateway import (
+    FORMULA_VERSION,
+    calculate_metrics,
+    current_metric_snapshot,
+    review_evidence_digest,
+)
 from finance_adapters.persistence.models import (
     AnalysisRun,
     AnomalyObservation,
@@ -41,11 +49,17 @@ from finance_adapters.persistence.models import (
     FilingVersion,
     FinancialFact,
     MetricResult,
-    PeerUniverse,
+    TableCandidateRecord,
     ValidationResult,
+)
+from finance_adapters.persistence.peer_gateway import (
+    PeerGateError,
+    run_peer_comparison,
+    save_peer_candidate,
 )
 from finance_adapters.persistence.review_gateway import recompute_filing_quality
 from finance_adapters.providers.llm_analysis import build_evidence_package, run_analysis
+from finance_adapters.providers.reproduction import build_reproduction_bundle
 from finance_adapters.security import ScanDisposition, database_update, scanner
 from finance_adapters.security.file_gate import scanned_object_path
 from finance_application.workflows.runtime import WorkflowRuntime
@@ -56,15 +70,52 @@ from finance_domain.analysis.contracts import (
     ModelSettingsUpdate,
     ReviewRequest,
 )
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
+from finreport_api.comparison_routes import router as comparison_router
+
 app = FastAPI(title="FinReport API", version="1.0.0")
+app.include_router(comparison_router)
+_recovery_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="extraction-recovery")
+_recovery_stop = Event()
+_recovery_thread: Thread | None = None
 
 
 @app.on_event("startup")
 def startup() -> None:
+    global _recovery_thread
     init_database()
+    _recover_extractions()
+    _recovery_stop.clear()
+    _recovery_thread = Thread(target=_recovery_loop, daemon=True, name="extraction-recovery-monitor")
+    _recovery_thread.start()
+
+
+def _recovery_loop() -> None:
+    import logging
+
+    while not _recovery_stop.wait(30):
+        try:
+            _recover_extractions()
+        except Exception:
+            logging.getLogger(__name__).exception("Extraction recovery scan failed")
+
+
+@app.on_event("shutdown")
+def shutdown() -> None:
+    _recovery_stop.set()
+    if _recovery_thread is not None:
+        _recovery_thread.join(timeout=2)
+
+
+def _recover_extractions(job_id: int | None = None) -> None:
+    from finance_adapters.persistence.database import SessionLocal
+
+    with SessionLocal() as session:
+        recovered = recover_expired_extractions(session, job_id)
+    for recovered_id in recovered:
+        _recovery_executor.submit(_background_extract, recovered_id)
 
 
 @app.middleware("http")
@@ -99,7 +150,7 @@ def envelope(request: Request, data):
         "request_id": getattr(request.state, "request_id", request.headers.get("X-Request-ID", "")),
         "data_as_of": datetime.now(UTC).isoformat(),
         "cache_generated_at": datetime.now(UTC).isoformat(),
-        "rule_version": "general-non-financial-v1",
+        "rule_version": FORMULA_VERSION,
     }
 
 
@@ -344,8 +395,12 @@ def create_job(
         .order_by(ExtractionJob.id.desc())
     )
     if existing:
+        for recovered_id in recover_expired_extractions(session, existing.id):
+            workflow_runtime.dispatch_extract(recovered_id, background)
+        session.refresh(existing)
         return envelope(request, {"job_id": existing.id, "status": existing.status, "reused": True})
     job = ExtractionJob(filing_version_id=filing.id)
+    queue_extraction(job)
     session.add(job)
     session.commit()
     workflow_runtime.dispatch_extract(job.id, background)
@@ -364,27 +419,13 @@ def get_job(request: Request, job_id: int, session: Session = Depends(get_sessio
     job = session.get(ExtractionJob, job_id)
     if job is None:
         raise HTTPException(404, "JOB_NOT_FOUND")
-    review_count = (
-        session.scalar(
-            select(FinancialFact)
-            .where(
-                FinancialFact.filing_version_id == job.filing_version_id,
-                FinancialFact.review_status == "needs_review",
-            )
-            .count()
-        )
-        if False
-        else len(
-            list(
-                session.scalars(
-                    select(FinancialFact).where(
-                        FinancialFact.filing_version_id == job.filing_version_id,
-                        FinancialFact.review_status == "needs_review",
-                    )
-                )
-            )
-        )
-    )
+    for recovered_id in recover_expired_extractions(session, job.id):
+        _recovery_executor.submit(_background_extract, recovered_id)
+    session.refresh(job)
+    review_count = session.scalar(select(func.count()).select_from(FinancialFact).where(
+        FinancialFact.filing_version_id == job.filing_version_id,
+        FinancialFact.review_status == "needs_review",
+    ))
     return envelope(
         request,
         {
@@ -406,13 +447,18 @@ def retry_job(request: Request, job_id: int, background: BackgroundTasks, sessio
     job = session.get(ExtractionJob, job_id)
     if job is None:
         raise HTTPException(404, "JOB_NOT_FOUND")
+    recovered = recover_expired_extractions(session, job.id)
+    session.refresh(job)
+    if recovered:
+        workflow_runtime.dispatch_extract(job.id, background)
+        return envelope(request, {"job_id": job.id, "status": job.status, "reused": True})
     if job.status != "failed" and not (job.status == "completed" and job.stage == "needs_review"):
         raise HTTPException(409, "JOB_NOT_RETRYABLE")
     try:
         scanned_object_path(session, get_filing(session, job.filing_version_id))
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
-    job.status, job.stage, job.error_code, job.error_detail = "queued", "queued", None, None
+    queue_extraction(job)
     session.commit()
     workflow_runtime.dispatch_extract(job.id, background)
     return envelope(request, {"job_id": job.id, "status": job.status, "reused": True})
@@ -423,10 +469,26 @@ def cancel_job(request: Request, job_id: int, session: Session = Depends(get_ses
     job = session.get(ExtractionJob, job_id)
     if job is None:
         raise HTTPException(404, "JOB_NOT_FOUND")
-    if job.status in {"completed", "failed", "cancelled"}:
+    changed = session.execute(update(ExtractionJob).where(
+        ExtractionJob.id == job_id, ExtractionJob.status.in_(["queued", "running"]),
+    ).values(
+        status="cancelled", stage="cancelled", error_code="CANCELLED",
+        error_detail="Cancelled by user", retryable=False, finished_at=datetime.now(UTC),
+        owner_token=None, lease_expires_at=None,
+    ), execution_options={"synchronize_session": False}).rowcount
+    if not changed:
+        session.rollback()
         raise HTTPException(409, "JOB_NOT_CANCELLABLE")
-    job.status, job.stage, job.error_code, job.error_detail = "cancelled", "cancelled", "CANCELLED", "Cancelled by user"
+    filing = session.get(FilingVersion, job.filing_version_id)
+    if filing is not None and filing.status == "extracting":
+        filing.status = "failed"
+    record_audit_event(
+        session, job.filing_version_id, category="workflow", action="pdf_extraction_cancelled",
+        status="cancelled", tool_name="extraction_lifecycle", tool_version="lease-v1",
+        detail={"extraction_job_id": job_id, "reason": "USER_CANCELLED"},
+    )
     session.commit()
+    session.refresh(job)
     return envelope(request, {"job_id": job.id, "status": job.status})
 
 
@@ -484,6 +546,69 @@ def list_validations(request: Request, filing_version_id: int, session: Session 
         ValidationResult.filing_version_id == filing.id,
     ).order_by(ValidationResult.id)))
     return envelope(request, {"filing_status": filing.status, "results": results})
+
+
+@app.get("/api/v1/filings/{filing_version_id}/tables")
+def list_tables(
+    request: Request,
+    filing_version_id: int,
+    page_no: int | None = Query(default=None, ge=1),
+    session: Session = Depends(get_session),
+):
+    """Read complete candidate tables and measured visual indentation for review."""
+    get_filing(session, filing_version_id)
+    latest_job_id = session.scalar(
+        select(ExtractionJob.id)
+        .join(TableCandidateRecord, TableCandidateRecord.extraction_job_id == ExtractionJob.id)
+        .where(ExtractionJob.filing_version_id == filing_version_id)
+        .order_by(ExtractionJob.id.desc())
+        .limit(1)
+    )
+    if latest_job_id is None:
+        return envelope(request, [])
+    query = select(TableCandidateRecord).where(
+        TableCandidateRecord.extraction_job_id == latest_job_id
+    )
+    if page_no is not None:
+        query = query.where(TableCandidateRecord.page_no == page_no)
+    tables = []
+    for candidate in session.scalars(query.order_by(TableCandidateRecord.page_no, TableCandidateRecord.id)):
+        records = candidate.rows
+        measured = bool(records) and isinstance(records[0], dict) and records[0].get("kind") == "header"
+        if measured:
+            header = records[0]
+            columns = header["cells"]
+            rows = [row for row in records[1:] if row.get("kind") == "body"]
+        else:
+            header = {}
+            columns = ["项目", "原数", "金额列"]
+            body = records
+            if candidate.extractor == "ocr-table-review-v1" and records:
+                columns, body = records[0], records[1:]
+            rows = [
+                {"row_index": index, "cells": cells, "raw_label": cells[0] if cells else "",
+                 "row_bbox": None, "label_layout": None}
+                for index, cells in enumerate(body)
+            ]
+        tables.append(
+            {
+                "id": candidate.id,
+                "extraction_job_id": candidate.extraction_job_id,
+                "page_no": candidate.page_no,
+                "table_name": header.get("table_name", "原表候选"),
+                "statement_type": header.get("statement_type"),
+                "columns": columns,
+                "column_roles": header.get("column_roles", []),
+                "rows": rows,
+                "table_bbox": header.get("table_bbox"),
+                "page_sha256": header.get("page_sha256"),
+                "layout_available": measured,
+                "extractor": candidate.extractor,
+                "confidence": candidate.confidence,
+                "review_required": candidate.review_required,
+            }
+        )
+    return envelope(request, tables)
 
 
 @app.patch("/api/v1/facts/{fact_id}/review")
@@ -547,19 +672,21 @@ def review_fact(
     review = session.scalar(select(FactReview).where(
         FactReview.fact_id == fact.id, FactReview.reviewer_id == reviewer_id,
     ))
+    session.flush()
+    evidence_digest = review_evidence_digest(session, fact)
     if review is None:
         review = FactReview(
             fact_id=fact.id,
             reviewer_id=reviewer_id,
             decision=payload.decision,
             reason=payload.reason,
-            evidence_digest=hashlib.sha256(json.dumps({"fact_id": fact.id, "value": str(fact.value), "reason": payload.reason}, sort_keys=True).encode()).hexdigest(),
+            evidence_digest=evidence_digest,
         )
         session.add(review)
     else:
         review.decision, review.reason = payload.decision, payload.reason
         review.reviewed_at = datetime.now(UTC)
-        review.evidence_digest = stable_hash({"fact_id": fact.id, "value": str(fact.value), "reason": payload.reason})
+        review.evidence_digest = evidence_digest
     session.commit()
     status = recompute_filing_quality(session, fact.filing_version_id)
     session.query(AnalysisRun).filter(AnalysisRun.filing_version_id == fact.filing_version_id).update(
@@ -594,7 +721,7 @@ def calculate(
             action="strict_metrics_calculated",
             status="completed",
             tool_name="metric_gateway",
-            tool_version="general-non-financial-v1",
+            tool_version=FORMULA_VERSION,
             input_hash=snapshot,
             output_hash=stable_hash([
                 {"code": item.metric_code, "value": str(item.value), "status": item.applicability_status}
@@ -623,7 +750,8 @@ def metric_trends(
     filings = list(
         session.scalars(
             select(FilingVersion)
-            .where(FilingVersion.company_id == company_id, FilingVersion.status == "facts_verified")
+            .where(FilingVersion.company_id == company_id,
+                   FilingVersion.status.in_(["facts_verified", "metrics_ready", "analysis_ready"]))
             .order_by(FilingVersion.period_end)
         )
     )
@@ -632,23 +760,52 @@ def metric_trends(
     comparable = len({(item.report_type, item.scope, item.accounting_standard, item.period_basis) for item in filings}) == 1
     if not comparable:
         return envelope(request, [{"status": "not_comparable", "explanation_code": "FILING_SCOPE_OR_PERIOD_MISMATCH", "filing_version_ids": [item.id for item in filings]}])
+    periods: dict[tuple[date, date], list[int]] = {}
+    for filing in filings:
+        periods.setdefault((filing.period_start, filing.period_end), []).append(filing.id)
+    ambiguous = [ids for ids in periods.values() if len(ids) > 1]
+    if ambiguous:
+        return envelope(request, [{
+            "status": "not_comparable", "explanation_code": "AMBIGUOUS_FILING_VERSIONS_FOR_PERIOD",
+            "filing_version_ids": [item for ids in ambiguous for item in ids],
+        }])
+    filing_by_id = {filing.id: filing for filing in filings}
     items = list(
         session.scalars(
             select(MetricResult).where(
                 MetricResult.filing_version_id.in_([f.id for f in filings]),
                 MetricResult.metric_code.in_(metric_codes),
                 MetricResult.computation_mode == "strict_audited",
+                MetricResult.quality_status == "strict_audited",
+                MetricResult.formula_version == FORMULA_VERSION,
+                MetricResult.scope == filings[0].scope,
+                MetricResult.period_basis == filings[0].period_basis,
             )
         )
     )
+    current_snapshots = {}
+    for filing in filings:
+        try:
+            current_snapshots[filing.id] = current_metric_snapshot(session, filing)
+        except ValueError:
+            current_snapshots[filing.id] = None
+    items.sort(key=lambda item: (filing_by_id[item.filing_version_id].period_end,
+                                 item.metric_code, item.id))
     return envelope(
         request,
         [
             {
                 "filing_version_id": item.filing_version_id,
                 "metric_code": item.metric_code,
-                "value": item.value,
-                "status": item.applicability_status,
+                "unit": item.unit,
+                "period_start": filing_by_id[item.filing_version_id].period_start,
+                "period_end": filing_by_id[item.filing_version_id].period_end,
+                "value": item.value if current_snapshots[item.filing_version_id]
+                and item.input_snapshot_hash == current_snapshots[item.filing_version_id] else None,
+                "status": item.applicability_status if current_snapshots[item.filing_version_id]
+                and item.input_snapshot_hash == current_snapshots[item.filing_version_id] else "stale_inputs",
+                "explanation_code": item.explanation_code if current_snapshots[item.filing_version_id]
+                and item.input_snapshot_hash == current_snapshots[item.filing_version_id] else "METRIC_INPUT_SNAPSHOT_CHANGED",
                 "formula_version": item.formula_version,
                 "quality_status": item.quality_status,
                 "scope": item.scope,
@@ -663,60 +820,17 @@ def metric_trends(
 def comparison(
     request: Request, payload: ComparisonRequest, session: Session = Depends(get_session)
 ):
-    universe = session.scalar(select(PeerUniverse).where(PeerUniverse.version == payload.peer_universe_version, PeerUniverse.status == "active"))
-    if universe is None or set(payload.peer_filing_ids) != set(universe.filing_ids) or len(universe.filing_ids) < 10 or universe.coverage < Decimal("0.80"):
-        return envelope(
-            request,
-            {
-                "status": "not_comparable",
-                "explanation_code": "INSUFFICIENT_FROZEN_PEERS",
-                "peer_universe_version": payload.peer_universe_version,
-            },
-        )
-    results = list(
-        session.scalars(
-            select(MetricResult).where(
-                MetricResult.filing_version_id.in_(payload.peer_filing_ids),
-                MetricResult.metric_code == payload.metric_code,
-                MetricResult.applicability_status == "calculated",
-                MetricResult.computation_mode == "strict_audited",
-            )
-        )
-    )
-    if len(results) < 10 or len(results) / max(len(payload.peer_filing_ids), 1) < 0.80:
-        return envelope(
-            request,
-            {
-                "status": "not_comparable",
-                "explanation_code": "INSUFFICIENT_QUALIFIED_PEERS",
-                "peer_universe_version": payload.peer_universe_version,
-            },
-        )
-    values = [float(item.value) for item in results if item.value is not None]
-    if len(values) < 10:
-        return envelope(request, {"status": "not_comparable", "explanation_code": "INSUFFICIENT_VALUES", "peer_universe_version": payload.peer_universe_version})
-    median = statistics.median(values)
-    deviations = [abs(value - median) for value in values]
-    mad = statistics.median(deviations)
-    snapshot = hashlib.sha256(__import__("json").dumps({"metric": payload.metric_code, "peers": payload.peer_filing_ids, "coverage": str(payload.coverage), "version": payload.peer_universe_version}, sort_keys=True).encode()).hexdigest()
-    run = ComparisonRun(peer_universe_version=payload.peer_universe_version, metric_code=payload.metric_code, input_snapshot_hash=snapshot, status="completed", output={"sample_count": len(values), "coverage": str(payload.coverage), "median": median, "mad": mad})
-    session.add(run)
-    session.commit()
-    return envelope(request, {"status": "completed", "comparison_run_id": run.id, "peer_universe_version": payload.peer_universe_version, "sample_count": len(values), "coverage": payload.coverage, "median": median, "mad": mad})
+    # No authenticated approval/provenance adapter exists yet: production fails closed.
+    return envelope(request, run_peer_comparison(session, payload.model_dump(mode="json")))
 
 
 @app.post("/api/v1/peer-universes", status_code=201)
 def create_peer_universe(request: Request, payload: dict, session: Session = Depends(get_session)):
-    required = {"version", "industry_code", "taxonomy_version", "data_cutoff", "filing_ids", "coverage"}
-    if not required.issubset(payload):
-        raise HTTPException(422, "PEER_UNIVERSE_FIELDS_REQUIRED")
-    ids = list(dict.fromkeys(int(value) for value in payload["filing_ids"]))
-    coverage = Decimal(str(payload["coverage"]))
-    status = "active" if len(ids) >= 10 and coverage >= Decimal("0.80") else "candidate"
-    universe = PeerUniverse(version=str(payload["version"]), industry_code=str(payload["industry_code"]), taxonomy_version=str(payload["taxonomy_version"]), data_cutoff=date.fromisoformat(str(payload["data_cutoff"])), filing_ids=ids, coverage=coverage, status=status, approval_trace=payload.get("approval_trace", []))
-    session.add(universe)
-    session.commit()
-    return envelope(request, {"version": universe.version, "status": universe.status, "sample_count": len(ids), "coverage": coverage})
+    try:
+        return envelope(request, save_peer_candidate(session, payload))
+    except PeerGateError as exc:
+        status = 409 if exc.code == "PEER_UNIVERSE_VERSION_ALREADY_EXISTS" else 422
+        raise HTTPException(status, exc.code) from exc
 
 
 @app.post("/api/v1/filings/{filing_version_id}/analyses", status_code=202)
@@ -786,6 +900,47 @@ def get_analysis(request: Request, analysis_run_id: int, session: Session = Depe
             "tool_trace": run.tool_trace,
             "invalidated_at": run.invalidated_at,
         },
+    )
+
+
+@app.get("/api/v1/analyses/{analysis_run_id}/reproduction")
+def export_reproduction(
+    analysis_run_id: int, session: Session = Depends(get_session),
+):
+    run = session.get(AnalysisRun, analysis_run_id)
+    if run is None:
+        raise HTTPException(404, "ANALYSIS_NOT_FOUND")
+    try:
+        bundle = build_reproduction_bundle(run)
+        if run.status == "completed":
+            package = build_evidence_package(session, run.filing_version_id)
+            if stable_hash(package) != run.input_snapshot_hash:
+                raise ValueError("REPRODUCTION_INPUT_SNAPSHOT_CHANGED")
+            current_input = {"status": "matches_execution_snapshot",
+                             "current_snapshot_hash": stable_hash(package)}
+        else:
+            # Preserve failed execution evidence even after its inputs changed or
+            # no longer meet strict gates; it is not a current financial report.
+            try:
+                package = build_evidence_package(session, run.filing_version_id)
+                current_hash = stable_hash(package)
+                current_input = {
+                    "status": "matches_execution_snapshot" if current_hash == run.input_snapshot_hash
+                    else "changed_since_execution", "current_snapshot_hash": current_hash,
+                }
+            except ValueError as exc:
+                current_input = {"status": "unavailable_under_current_gates", "reason": str(exc)}
+        bundle["payload"]["current_input_status"] = {
+            **current_input, "execution_snapshot_hash": run.input_snapshot_hash,
+            "export_kind": "current_completed_analysis" if run.status == "completed"
+            else "historical_failed_analysis_diagnostic",
+        }
+        bundle["payload_sha256"] = stable_hash(bundle["payload"])
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return JSONResponse(
+        content=bundle,
+        headers={"Content-Disposition": f'attachment; filename="analysis-{run.id}-reproduction.json"'},
     )
 
 

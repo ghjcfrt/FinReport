@@ -2,22 +2,103 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import re
+from collections import defaultdict
 from decimal import Decimal
 
-from sqlalchemy import select
+from finance_domain.metrics.definitions import is_financial_industry
+from finance_domain.metrics.formulas import free_cash_flow
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session, object_session
 
 from finance_adapters.persistence.models import (
     Company,
     EvidenceFragment,
     FactDimension,
+    FactReview,
     FilingVersion,
     FinancialFact,
     MetricResult,
     ValidationResult,
 )
 
-FORMULA_VERSION = "general-non-financial-v1"
+FORMULA_VERSION = "general-non-financial-v2"
+
+
+def _related_records(session: Session, model, fact_ids: list[int], *ordering) -> dict:
+    """Batch within conservative bind limits; no cross-request ORM cache."""
+    grouped = defaultdict(list)
+    for start in range(0, len(fact_ids), 500):
+        query = select(model).where(model.fact_id.in_(fact_ids[start:start + 500]))
+        for row in session.scalars(query.order_by(*ordering)):
+            grouped[row.fact_id].append(row)
+    return grouped
+
+
+def _snapshot_record(fact: FinancialFact, evidence, dimensions) -> dict:
+    return {
+        "id": fact.id,
+        "code": fact.concept_code,
+        "value": str(Decimal(fact.value).quantize(Decimal("0.0001"))),
+        "revision": fact.revision_no,
+        "currency": fact.currency, "unit_scale": fact.unit_scale,
+        "period_start": str(fact.period_start), "period_end": str(fact.period_end),
+        "statement_type": fact.statement_type,
+        "dimensions": [[d.dimension_name, d.dimension_value] for d in dimensions],
+        "evidence": [{"id": e.id, "page": e.page_no, "sha256": e.page_sha256,
+                      "row": e.row_locator, "column": e.column_locator,
+                      "bbox": e.bounding_box, "raw_value": e.raw_value} for e in evidence],
+    }
+
+
+def _review_digest(fact: FinancialFact, evidence, dimensions) -> str:
+    payload = {
+        "version": "fact-review-evidence-v1",
+        "snapshot": _snapshot_record(fact, evidence, dimensions),
+        "filing_version_id": fact.filing_version_id,
+        "concept_name": fact.concept_name,
+        "assurance_level": fact.assurance_level,
+        "flow_or_stock": fact.flow_or_stock,
+        "raw_value": fact.raw_value,
+        "comparative_period": fact.comparative_period,
+        "is_restatement": fact.is_restatement,
+        "evidence_metadata": [{"id": item.id, "table": item.table_name,
+                               "raw_label": item.raw_label, "extractor": item.extractor,
+                               "confidence": str(Decimal(item.confidence).quantize(Decimal("0.0001")))}
+                              for item in evidence],
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def review_evidence_digest(session: Session, fact: FinancialFact) -> str:
+    """Bind an approval to the exact reviewed value, units, period and evidence."""
+    evidence = _related_records(session, EvidenceFragment, [fact.id], EvidenceFragment.id)
+    dimensions = _related_records(session, FactDimension, [fact.id],
+                                  FactDimension.dimension_name, FactDimension.dimension_value)
+    return _review_digest(fact, evidence[fact.id], dimensions[fact.id])
+
+
+def has_current_approvals(fact: FinancialFact, reviews, evidence, dimensions) -> bool:
+    digest = _review_digest(fact, evidence, dimensions)
+    confirmed = {review.reviewer_id.strip() for review in reviews
+                 if review.decision in {"confirmed", "corrected"}
+                 and review.reviewer_id.strip() and review.evidence_digest == digest}
+    return (len(confirmed) >= 2 and bool(evidence) and all(_located(item) for item in evidence)
+            and not any(review.decision == "rejected" for review in reviews))
+
+
+def _located(evidence: EvidenceFragment | None) -> bool:
+    if evidence is None or not evidence.row_locator or not evidence.column_locator:
+        return False
+    if evidence.page_no < 1 or not re.fullmatch(r"[0-9a-fA-F]{64}", evidence.page_sha256):
+        return False
+    box = evidence.bounding_box or {}
+    coordinates = box.get("value") or box.get("row") or box.get("bbox")
+    return (isinstance(coordinates, list) and len(coordinates) == 4
+            and all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                    and math.isfinite(value) for value in coordinates)
+            and coordinates[0] < coordinates[2] and coordinates[1] < coordinates[3])
 
 
 def require_supported_period(filing: FilingVersion) -> None:
@@ -44,7 +125,7 @@ def require_source_assurance(session: Session, filing: FilingVersion) -> None:
 def current_verified_facts(session: Session, filing: FilingVersion) -> dict[str, FinancialFact]:
     require_supported_period(filing)
     facts: dict[str, FinancialFact] = {}
-    for fact in session.scalars(select(FinancialFact).where(
+    candidates = list(session.scalars(select(FinancialFact).where(
         FinancialFact.filing_version_id == filing.id,
         FinancialFact.review_status != "superseded",
         FinancialFact.quality_status == "facts_verified",
@@ -53,46 +134,57 @@ def current_verified_facts(session: Session, filing: FilingVersion) -> dict[str,
         FinancialFact.is_restatement.is_(False),
         FinancialFact.period_start == filing.period_start,
         FinancialFact.period_end == filing.period_end,
-    ).order_by(FinancialFact.id)):
-        scopes = list(session.scalars(select(FactDimension.dimension_value).where(
-            FactDimension.fact_id == fact.id, FactDimension.dimension_name == "scope",
-        )))
+    ).order_by(FinancialFact.id)))
+    ids = [fact.id for fact in candidates]
+    dimensions = _related_records(session, FactDimension, ids,
+                                  FactDimension.dimension_name, FactDimension.dimension_value)
+    evidence = _related_records(session, EvidenceFragment, ids, EvidenceFragment.id)
+    reviews = _related_records(session, FactReview, ids)
+    for fact in candidates:
+        scopes = [d.dimension_value for d in dimensions[fact.id] if d.dimension_name == "scope"]
         if not scopes or any(scope != filing.scope for scope in scopes):
             raise ValueError("FACT_SCOPE_MISMATCH")
         if fact.concept_code in facts:
             raise ValueError("AMBIGUOUS_CURRENT_FACT")
         if fact.assurance_level != "audited_annual":
             raise ValueError("STRICT_AUDIT_ASSURANCE_REQUIRED")
-        if not Decimal(fact.value).is_finite() or fact.unit_scale <= 0 or fact.currency != "CNY":
+        if (not Decimal(fact.value).is_finite()
+                or fact.unit_scale not in {1, 1000, 10000, 1000000, 100000000}
+                or fact.currency != "CNY"):
             raise ValueError("FACT_UNIT_OR_VALUE_INVALID")
+        if not has_current_approvals(fact, reviews[fact.id], evidence[fact.id], dimensions[fact.id]):
+            raise ValueError("FACT_REVIEW_SNAPSHOT_STALE")
         facts[fact.concept_code] = fact
     return facts
 
 
 def _snapshot(facts: dict[str, FinancialFact]) -> str:
     value = []
+    sessions = defaultdict(list)
+    for fact in facts.values():
+        if (session := object_session(fact)) is not None:
+            sessions[session].append(fact.id)
+    related = {}
+    for session, ids in sessions.items():
+        related[session] = (
+            _related_records(session, EvidenceFragment, ids, EvidenceFragment.id),
+            _related_records(session, FactDimension, ids,
+                             FactDimension.dimension_name, FactDimension.dimension_value),
+        )
     for fact in sorted(facts.values(), key=lambda item: (item.concept_code, item.id)):
         session = object_session(fact)
-        evidence = list(session.scalars(select(EvidenceFragment).where(
-            EvidenceFragment.fact_id == fact.id,
-        ).order_by(EvidenceFragment.id))) if session else []
-        dimensions = list(session.scalars(select(FactDimension).where(
-            FactDimension.fact_id == fact.id,
-        ).order_by(FactDimension.dimension_name, FactDimension.dimension_value))) if session else []
-        value.append({
-            "id": fact.id,
-            "code": fact.concept_code,
-            "value": str(Decimal(fact.value).quantize(Decimal("0.0001"))),
-            "revision": fact.revision_no,
-            "currency": fact.currency, "unit_scale": fact.unit_scale,
-            "period_start": str(fact.period_start), "period_end": str(fact.period_end),
-            "statement_type": fact.statement_type,
-            "dimensions": [[d.dimension_name, d.dimension_value] for d in dimensions],
-            "evidence": [{"id": e.id, "page": e.page_no, "sha256": e.page_sha256,
-                          "row": e.row_locator, "column": e.column_locator,
-                          "bbox": e.bounding_box, "raw_value": e.raw_value} for e in evidence],
-        })
+        evidence, dimensions = related[session] if session else ({}, {})
+        value.append(_snapshot_record(fact, evidence.get(fact.id, []), dimensions.get(fact.id, [])))
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
+def current_metric_snapshot(session: Session, filing: FilingVersion) -> str:
+    """Validate live audited inputs before displaying a persisted metric."""
+    require_source_assurance(session, filing)
+    facts = current_verified_facts(session, filing)
+    if not facts:
+        raise ValueError("STRICT_FACTS_REQUIRED")
+    return _snapshot(facts)
 
 
 def _result(
@@ -150,9 +242,14 @@ def calculate_metrics(session: Session, filing_id: int) -> list[MetricResult]:
     facts = current_verified_facts(session, filing)
     if not facts:
         raise ValueError("STRICT_FACTS_REQUIRED")
+    # Preserve historical values/IDs for audit bundles while preventing an old
+    # admission policy from being presented as the current calculation.
+    session.execute(update(MetricResult).where(
+        MetricResult.filing_version_id == filing_id,
+        MetricResult.formula_version != FORMULA_VERSION,
+    ).values(applicability_status="superseded", quality_status="superseded"))
     company = session.get(Company, filing.company_id)
-    financial_industries = {"bank", "insurance", "broker", "finance", "J66", "J67", "J68"}
-    is_financial = bool(company and (company.industry_code in financial_industries or company.industry_code.lower() in financial_industries))
+    is_financial = bool(company and is_financial_industry(company.industry_code))
     snapshot = _snapshot(facts)
     values: list[MetricResult] = []
     direct = {
@@ -262,16 +359,18 @@ def calculate_metrics(session: Session, filing_id: int) -> list[MetricResult]:
         session.commit()
         return values
     if cfo and capex:
+        fcf, issue = free_cash_flow(cfo.value, capex.value)
         values.append(
             _result(
                 session,
                 filing_id,
                 "free_cash_flow",
                 "currency",
-                cfo.value - capex.value,
-                "calculated",
+                fcf,
+                "insufficient_data" if issue else "calculated",
                 [cfo.id, capex.id],
                 snapshot,
+                issue or None,
             )
         )
     else:

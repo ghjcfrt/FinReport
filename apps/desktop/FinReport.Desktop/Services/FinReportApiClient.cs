@@ -109,6 +109,13 @@ public sealed class FinReportApiClient(HttpClient http)
         return response?.Data ?? Array.Empty<FactItem>();
     }
 
+    public async Task<OriginalTableItem[]> GetTablesAsync(long filingId, CancellationToken cancellationToken)
+    {
+        var response = await http.GetFromJsonAsync<ApiEnvelope<OriginalTableItem[]>>(
+            $"api/v1/filings/{filingId}/tables", ApiJson, cancellationToken);
+        return response?.Data ?? Array.Empty<OriginalTableItem>();
+    }
+
     public async Task ReviewFactAsync(long factId, string reviewerId, string decision, string reason, decimal? correctedValue, CancellationToken cancellationToken)
     {
         using var response = await http.PatchAsJsonAsync($"api/v1/facts/{factId}/review",
@@ -188,7 +195,41 @@ public sealed record FactItem(long Id, string ConceptCode, string ConceptName, d
     public string AmountDisplay => $"{Value:N2} {Currency}元";
     public string SourceDisplay => $"第{Evidence?.PageNo}页 / {Evidence?.TableName} / {Evidence?.ColumnLocator} / 原数 {RawValue} × {UnitScale}";
 }
-public sealed record FactEvidence(int PageNo, string TableName, string RowLocator, string ColumnLocator, string RawLabel, string RawValue);
+public sealed record FactEvidence(int PageNo, string TableName, string RowLocator, string ColumnLocator, string RawLabel, string RawValue, EvidenceBoundingBox? BoundingBox = null);
+public sealed record EvidenceBoundingBox(LabelLayout? LabelLayout = null);
+public sealed record LabelLayout(
+    double? LabelStartX = null,
+    double? BodyStartX = null,
+    string? Prefix = null,
+    double? IndentPoints = null,
+    int? IndentLevel = null,
+    double[]? LabelBbox = null,
+    double? FontSize = null,
+    string? Source = null,
+    double? TableOriginX = null)
+{
+    // PDF coordinates use points (1/72 inch); WPF uses DIP (1/96 inch).
+    // Legacy evidence with no geometry stays flush left. IndentLevel is only
+    // descriptive; it never controls a fixed amount of padding.
+    public double IndentDip => IndentPoints is double points && double.IsFinite(points)
+        ? Math.Max(0, points) * 96.0 / 72.0 : 0;
+}
+public sealed record OriginalTableItem(
+    long Id,
+    long ExtractionJobId,
+    int PageNo,
+    string? TableName,
+    string[]? Columns,
+    OriginalTableRow[]? Rows,
+    string? Extractor,
+    decimal? Confidence,
+    bool ReviewRequired,
+    string? PageSha256);
+public sealed record OriginalTableRow(
+    string[]? Cells,
+    string? RawLabel,
+    LabelLayout? LabelLayout = null,
+    double[]? RowBbox = null);
 public sealed record ValidationSummary(string FilingStatus, ValidationItem[] Results);
 public sealed record ValidationItem(string RuleCode, string Status, string? ActualValue, string? ExpectedValue);
 public sealed record AnalysisStatus(string Status, JsonElement? Output, string? FailureReason);

@@ -14,10 +14,15 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from finance_adapters.config import settings
-from finance_adapters.persistence.metric_gateway import _snapshot, current_verified_facts
+from finance_adapters.persistence.metric_gateway import (
+    FORMULA_VERSION,
+    _snapshot,
+    current_verified_facts,
+)
 from finance_adapters.persistence.models import (
     AnalysisRun,
     AnomalyObservation,
+    AuditEvent,
     Company,
     EvidenceFragment,
     FilingVersion,
@@ -30,6 +35,7 @@ from finance_adapters.providers.llm_analysis import (
     split_claim_text,
     validate_analysis_output,
 )
+from finance_adapters.providers.reproduction import validate_saved_analysis_run
 
 METRIC_NAMES = {
     "revenue": "营业收入",
@@ -49,7 +55,7 @@ h3 {font-size:11pt;margin-bottom:5pt}
 p,li {margin-top:4pt;margin-bottom:7pt}
 table {border-collapse:collapse;width:100%;font-size:8pt;margin-top:8pt}
 th,td {border:1px solid #bdc9d6;padding:6pt;text-align:left;vertical-align:top}
-th {background-color:#edf2f7}
+th {font-weight:bold}
 .meta,.limitations {color:#4b5563;font-size:9pt}
 .claim {margin-bottom:14pt}
 .evidence {font-size:9pt}
@@ -97,6 +103,8 @@ def _validated_inputs(session: Session, filing_id: int):
             .where(
                 MetricResult.filing_version_id == filing_id,
                 MetricResult.computation_mode == "strict_audited",
+                MetricResult.applicability_status != "superseded",
+                MetricResult.quality_status != "superseded",
             )
             .order_by(MetricResult.id)
         )
@@ -106,6 +114,8 @@ def _validated_inputs(session: Session, filing_id: int):
         for metric in metrics
         if metric.applicability_status == "calculated" and metric.value is not None
     ]
+    if any(metric.formula_version != FORMULA_VERSION for metric in metrics):
+        raise ValueError("EXPORT_UNSUPPORTED_METRIC_FORMULA_VERSION")
     if not usable:
         raise ValueError("EXPORT_STRICT_METRICS_REQUIRED")
     analysis = session.scalar(
@@ -157,6 +167,10 @@ def _validated_inputs(session: Session, filing_id: int):
         validate_analysis_output(analysis.output, package)
     except ValueError as exc:
         raise ValueError(f"EXPORT_ANALYSIS_INVALID:{exc}") from exc
+    try:
+        validate_saved_analysis_run(analysis, package)
+    except (ValueError, KeyError, TypeError) as exc:
+        raise ValueError(f"EXPORT_ANALYSIS_PROVENANCE_INVALID:{exc}") from exc
     metric_ids = {item["id"] for item in package["metrics"]}
     evidence_ids = {item["id"] for item in package["evidence"]}
     if not evidence_ids or any(
@@ -169,7 +183,8 @@ def _validated_inputs(session: Session, filing_id: int):
 
 
 def _render_html(
-    filing, company, metrics, analysis, output, facts, evidence, anomalies, package
+    filing, company, metrics, analysis, output, facts, evidence, anomalies, package,
+    *, test_waiver: bool = False,
 ) -> str:
     metric_rows = "".join(
         f"<tr><td>{_escape(METRIC_NAMES.get(item.metric_code, item.metric_code))}"
@@ -220,12 +235,37 @@ def _render_html(
         or "<li>无异常观察记录。</li>"
     )
     limitations = "".join(f"<li>{_escape(item)}</li>" for item in output.limitations)
+    trace = analysis.tool_trace or {}
+    attempts = trace.get("attempts", [])
+    execution_rows = "".join(
+        f"<tr><td>{_escape(item.get('attempt'))}</td>"
+        f"<td>{_escape(item.get('provider_response_id'))}</td>"
+        f"<td>{_escape(item.get('status'))}</td>"
+        f"<td>{_escape(item.get('provider_metadata', {}).get('duration_seconds'))}</td>"
+        f"<td>{_escape((item.get('provider_metadata', {}).get('usage') or {}).get('total_tokens'))}</td>"
+        f"<td>{'有供应商暴露文本' if item.get('provider_metadata', {}).get('reasoning_output') else '未返回思考正文'}</td></tr>"
+        for item in attempts
+    )
+    context = package.get("document_context", {})
+    selected_sources = {
+        assertion.source_id for claim in output.claims for assertion in claim.source_assertions
+    }
+    context_rows = "".join(
+        f"<li>原生上下文 {_escape(item['id'])}，PDF第{item['page_no']}页，"
+        f"未人审；选项：{_escape(item.get('selected_answer') or item.get('selection_status'))}。"
+        f"<br>{_escape(item['text']).replace(chr(10), '<br>')}</li>"
+        for item in context.get("excerpts", []) if item["id"] in selected_sources
+    ) or "<li>本次模型没有引用原生文字上下文。</li>"
+    review_summary = _escape(output.qualitative_summary) or "模型未提供定性总结。"
+    review_mode = ("用户授权的测试豁免：未完成双人独立复核，不构成正式人审通过。"
+                   if test_waiver else "按当前事实审核状态生成；具体审核记录见审计轨迹。")
     scope = {"consolidated": "合并口径", "parent": "母公司口径"}.get(filing.scope, filing.scope)
     generated = datetime.now(UTC).isoformat()
     return f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><title>FinReport 财报分析报告</title>
 <style>{CSS}</style></head><body>
 <h1>财报分析报告</h1>
+<p><strong>{review_mode}</strong></p>
 <p class="meta">自动核验仅覆盖指标数值、公式与引用。模型定性文字未做语义核验，列于待人工复核区。</p>
 <p>公司：{_escape(company.name if company else filing.company_id)}；股票代码：{_escape(company.stock_code if company else "未知")}</p>
 <p>报告期间：{filing.period_start.isoformat()} 至 {filing.period_end.isoformat()}；{_escape(scope)}；报告类型：{_escape(filing.report_type)}</p>
@@ -239,7 +279,17 @@ def _render_html(
 <h2>证据索引</h2><ul class="evidence">{evidence_rows}</ul>
 <h2>模型定性观点：待人工复核</h2>
 <p class="meta">模型自由总结未做语义核验，未作为报告总体结论输出；定性观点可能与指标矛盾。</p>
+<h3>模型定性总结</h3><p>{review_summary}</p>
 {review_rows}
+<h2>过程透明与复现</h2>
+<p>输入快照 SHA-256：{_escape(analysis.input_snapshot_hash)}<br>工具轨迹 SHA-256：{_escape(analysis.tool_trace_hash)}</p>
+<p>程序扫描页数：{_escape(context.get('total_pages', '不可用'))}；实际模型摘录页码：{_escape(context.get('selected_page_numbers', []))}；摘录行数：{_escape(context.get('model_input_line_count', 0))}。只对实际摘录声明模型输入覆盖。</p>
+<p>候选摘录：{_escape(context.get('candidate_excerpt_count', 0))}；因预算省略：{_escape(context.get('omitted_excerpt_count', 0))}；不完整问项：{_escape(context.get('incomplete_question_count', 0))}。不完整问项禁止支撑独立定性断言；跨页问项仍需人工核对。</p>
+<p class="meta">省略原因：{_escape(context.get('omission_reasons', {}))}</p>
+<table><tr><th>调用</th><th>供应商响应ID</th><th>校验结果</th><th>耗时秒</th><th>总tokens</th><th>思考字段</th></tr>{execution_rows}</table>
+<p class="meta">供应商暴露的思考文本不等于完整内部推理，也不证明财务结论正确。原始请求、响应、失败校验和渲染前后对照保存在复现包中。</p>
+<p>离线复现包接口：/api/v1/analyses/{analysis.id}/reproduction。离线重放校验原有输入输出；再次联网调用模型不保证逐字相同。哈希不能防止数据库管理员同时改写数据与哈希。</p>
+<h3>模型引用的原生文字上下文</h3><ul class="evidence">{context_rows}</ul>
 <h2>分析边界与限制</h2><ul class="limitations">{limitations}</ul>
 <footer>仅供研究与教学，不构成投资建议。导出使用已完成且未失效的分析，并与当前输入快照核对一致。</footer>
 </body></html>"""
@@ -297,6 +347,10 @@ def generate_export(session: Session, filing_id: int, output_format: str) -> Pat
     filing, metrics, analysis, output, facts, evidence_ids, package = _validated_inputs(
         session, filing_id
     )
+    waiver = session.scalar(select(AuditEvent.id).where(
+        AuditEvent.filing_version_id == filing_id,
+        AuditEvent.action == "user_authorized_test_review_waiver",
+    ))
     company = session.get(Company, filing.company_id)
     evidence = list(
         session.scalars(
@@ -336,6 +390,7 @@ def generate_export(session: Session, filing_id: int, output_format: str) -> Pat
                     "status",
                     "formula_version",
                     "input_snapshot_hash",
+                    "review_mode",
                 ]
             )
             writer.writerows(
@@ -355,13 +410,15 @@ def generate_export(session: Session, filing_id: int, output_format: str) -> Pat
                         item.applicability_status,
                         item.formula_version,
                         item.input_snapshot_hash,
+                        "user_authorized_test_only" if waiver else "standard_review_state",
                     ]
                     for item in metrics
                 ]
             )
         return target
     page = _render_html(
-        filing, company, metrics, analysis, output, facts, evidence, anomalies, package
+        filing, company, metrics, analysis, output, facts, evidence, anomalies, package,
+        test_waiver=waiver is not None,
     )
     if output_format == "html":
         target.write_text(page, encoding="utf-8")

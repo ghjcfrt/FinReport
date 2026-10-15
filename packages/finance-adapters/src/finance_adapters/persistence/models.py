@@ -83,6 +83,9 @@ class ExtractionJob(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    queued_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    owner_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class AuditEvent(Base):
@@ -182,7 +185,7 @@ class IndustryModule(Base):
 class FactDimension(Base):
     __tablename__ = "fact_dimensions"
     id: Mapped[int] = mapped_column(primary_key=True)
-    fact_id: Mapped[int] = mapped_column(ForeignKey("financial_facts.id"))
+    fact_id: Mapped[int] = mapped_column(ForeignKey("financial_facts.id"), index=True)
     dimension_name: Mapped[str] = mapped_column(String(96))
     dimension_value: Mapped[str] = mapped_column(String(256))
 
@@ -190,7 +193,7 @@ class FactDimension(Base):
 class EvidenceFragment(Base):
     __tablename__ = "evidence_fragments"
     id: Mapped[int] = mapped_column(primary_key=True)
-    fact_id: Mapped[int] = mapped_column(ForeignKey("financial_facts.id"))
+    fact_id: Mapped[int] = mapped_column(ForeignKey("financial_facts.id"), index=True)
     page_no: Mapped[int] = mapped_column(Integer)
     table_name: Mapped[str] = mapped_column(String(256), default="unclassified")
     row_locator: Mapped[str] = mapped_column(String(256))
@@ -273,7 +276,7 @@ class MetricResult(Base):
     metric_code: Mapped[str] = mapped_column(String(96))
     value: Mapped[Decimal | None] = mapped_column(Numeric(24, 8), nullable=True)
     unit: Mapped[str] = mapped_column(String(32))
-    formula_version: Mapped[str] = mapped_column(String(64), default="general-non-financial-v1")
+    formula_version: Mapped[str] = mapped_column(String(64), default="general-non-financial-v2")
     applicability_status: Mapped[str] = mapped_column(String(32))
     computation_mode: Mapped[str] = mapped_column(String(32))
     input_fact_ids: Mapped[list] = mapped_column(JSON, default=list)

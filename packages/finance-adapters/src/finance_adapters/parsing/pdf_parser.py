@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import time
+from dataclasses import asdict
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -17,6 +18,11 @@ from finance_adapters.parsing.statement_extractor import (
     parse_number,
 )
 from finance_adapters.persistence.audit import record_audit_event, stable_hash
+from finance_adapters.persistence.extraction_lifecycle import (
+    ExtractionHeartbeat,
+    claim_extraction,
+    transition_extraction,
+)
 from finance_adapters.persistence.models import (
     EvidenceFragment,
     ExtractionJob,
@@ -32,7 +38,8 @@ from finance_adapters.providers.model_clients import ModelClient, ModelConfig
 from finance_adapters.security.file_gate import scanned_object_path
 from finance_adapters.storage.object_storage import file_sha256
 
-PARSER_VERSION = "pymupdf-statements-v2"
+PARSER_VERSION = "pymupdf-statements-v3"
+TABLE_LAYOUT_VERSION = "pymupdf-statement-layout-v1"
 
 # Extraction is deliberately conservative. Unknown labels remain candidates and cannot enter strict calculations.
 CONCEPTS = {
@@ -173,7 +180,11 @@ def _run_ocr(
     started = time.perf_counter()
     last_error = None
     text = ""
+    expected_owner = job.owner_token
     for attempt in range(settings.ocr_max_retries + 1):
+        session.refresh(job)
+        if job.status != "running" or job.owner_token != expected_owner:
+            raise ValueError("EXTRACTION_NOT_RUNNING")
         try:
             text, trace = client.vision(
                 system="Return the page faithfully; preserve table cells, headings and units.",
@@ -236,6 +247,13 @@ def run_extraction(session: Session, job_id: int) -> None:
     filing = session.get(FilingVersion, filing_id)
     if filing is None:
         return
+    owner = claim_extraction(session, job_id)
+    if owner is None:
+        session.expire_all()
+        return
+    session.refresh(job)
+    heartbeat = ExtractionHeartbeat(session, job_id, owner)
+    heartbeat.start()
     document = None
     try:
         if filing.period_basis != "annual" or filing.report_type != "annual":
@@ -248,9 +266,6 @@ def run_extraction(session: Session, job_id: int) -> None:
         ):
             raise ValueError("ANNUAL_PERIOD_MISMATCH")
         path = scanned_object_path(session, filing)
-        _clear_job_candidates(session, filing_id, job_id)
-        job.status, job.stage, job.progress = "running", "extracting", 5
-        job.started_at, job.finished_at = datetime.now(UTC), None
         job.parser_version, job.error_code, job.error_detail = PARSER_VERSION, None, None
         filing.status = "extracting"
         record_audit_event(
@@ -288,28 +303,35 @@ def run_extraction(session: Session, job_id: int) -> None:
                 )
             )
         ocr_seen = False
-        job.stage = "normalizing"
+        if not transition_extraction(session, job_id, owner, stage="normalizing"):
+            session.rollback()
+            return
         session.commit()
         for index, page in enumerate(document):
             session.refresh(job)
-            if job.status == "cancelled":
-                filing.status = "failed"
-                job.error_code, job.error_detail = "CANCELLED", "Cancelled by user"
-                session.commit()
+            if job.status != "running" or job.owner_token != owner:
                 return
             text = page_texts[index]
             if text.strip():
                 page_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
-                extractor.add_page(page, index + 1, page_hash)
+                extractor.add_page(page, index + 1, page_hash, native_text=text)
             elif ocr_client:
                 ocr_text = _run_ocr(session, job, filing, page, index + 1, ocr_client)
                 if ocr_table_candidates(ocr_text):
                     extractor.issues.append(f"page:{index + 1}:OCR_POSITION_AND_SCOPE_UNCONFIRMED")
                 ocr_seen = True
-            job.progress = max(5, int((index + 1) / max(len(document), 1) * 80))
             # Long documents retain visible progress without committing each fact.
             if index % 10 == 0:
+                if not transition_extraction(session, job_id, owner, progress=max(
+                    5, int((index + 1) / max(len(document), 1) * 80),
+                )):
+                    session.rollback()
+                    return
                 session.commit()
+        session.refresh(job)
+        if job.status != "running" or job.owner_token != owner:
+            session.rollback()
+            return
         if not extractor.facts:
             raise ValueError(
                 "OCR_MANUAL_VERIFICATION_REQUIRED"
@@ -318,6 +340,8 @@ def run_extraction(session: Session, job_id: int) -> None:
                 if not any(text.strip() for text in page_texts)
                 else "PRIMARY_STATEMENTS_NOT_EXTRACTED"
             )
+        # Candidate cleanup and replacement are atomic with the fenced completion.
+        _clear_job_candidates(session, filing_id, job_id)
         existing_facts = list(
             session.scalars(
                 select(FinancialFact).where(FinancialFact.filing_version_id == filing_id)
@@ -328,6 +352,8 @@ def run_extraction(session: Session, job_id: int) -> None:
         for candidate in extractor.facts.values():
             previous = [
                 fact for fact in existing_facts if fact.concept_code == candidate.concept_code
+                and fact.period_start == filing.period_start and fact.period_end == filing.period_end
+                and not fact.comparative_period
             ]
             protected = [
                 fact
@@ -382,6 +408,9 @@ def run_extraction(session: Session, job_id: int) -> None:
                         "unit_page_no": candidate.unit_page_no,
                         "unit_text": candidate.unit_text,
                         "value_basis": "normalized_currency",
+                        "label_layout": asdict(candidate.label_layout)
+                        if candidate.label_layout is not None
+                        else None,
                     },
                     page_sha256=candidate.page_sha256,
                     confidence=Decimal("0.9000"),
@@ -400,17 +429,32 @@ def run_extraction(session: Session, job_id: int) -> None:
                     dimension_value="normalized_currency",
                 )
             )
+        from finance_adapters.parsing.comparative import persist_comparative_candidates
+
+        comparative_count = persist_comparative_candidates(
+            session, filing, job_id, extractor, audited=audited,
+        )
         for page_no in extractor.statement_pages:
+            table = extractor.tables.get(page_no)
+            if table is None:
+                continue
             session.add(
                 TableCandidateRecord(
                     extraction_job_id=job_id,
                     page_no=page_no,
                     rows=[
-                        [item.raw_label, item.raw_value, item.column_label]
-                        for item in extractor.facts.values()
-                        if item.page_no == page_no
+                        {
+                            "kind": "header",
+                            "cells": list(table.headers),
+                            "column_roles": list(table.column_roles),
+                            "table_name": table.table_name,
+                            "statement_type": table.statement_type,
+                            "table_bbox": list(table.table_bbox),
+                            "page_sha256": table.page_sha256,
+                        },
+                        *[{"kind": "body", **asdict(row)} for row in table.rows],
                     ],
-                    extractor=PARSER_VERSION,
+                    extractor=TABLE_LAYOUT_VERSION,
                     confidence=Decimal("0.9000"),
                     review_required=True,
                 )
@@ -458,12 +502,12 @@ def run_extraction(session: Session, job_id: int) -> None:
                     expected_value="confirmed_columns_units_and_unambiguous_primary_rows",
                 )
             )
-        job.status, job.stage, job.progress, job.finished_at = (
-            "completed",
-            "needs_review",
-            100,
-            datetime.now(UTC),
-        )
+        if not transition_extraction(
+            session, job_id, owner, status="completed", stage="needs_review", progress=100,
+            finished_at=datetime.now(UTC), owner_token=None, lease_expires_at=None,
+        ):
+            session.rollback()
+            return
         filing.status = "needs_review"
         record_audit_event(
             session,
@@ -475,10 +519,12 @@ def run_extraction(session: Session, job_id: int) -> None:
             tool_name="pymupdf",
             tool_version=PARSER_VERSION,
             input_hash=filing.file_sha256,
-            output_hash=stable_hash({"fact_count": len(extractor.facts), "job_id": job_id}),
+            output_hash=stable_hash({"current_fact_count": len(extractor.facts),
+                                     "comparative_fact_count": comparative_count, "job_id": job_id}),
             detail={
                 "extraction_job_id": job_id,
                 "fact_count": len(extractor.facts),
+                "comparative_fact_count": comparative_count,
                 "statement_pages": extractor.statement_pages,
                 "issues": extractor.issues,
                 "value_basis": "normalized_currency",
@@ -488,6 +534,7 @@ def run_extraction(session: Session, job_id: int) -> None:
             },
         )
         session.commit()
+        session.refresh(job)
     except Exception as exc:  # noqa: BLE001 - rollback failed inserts before persisting failure
         detail = str(exc)
         session.rollback()
@@ -495,9 +542,15 @@ def run_extraction(session: Session, job_id: int) -> None:
         filing = session.get(FilingVersion, filing_id)
         if job is None or filing is None:
             return
-        job.status, job.stage = "failed", "failed"
-        job.error_code = "OCR_FAILURE" if "OCR" in detail else "PARSER_FAILURE"
-        job.error_detail, job.retryable, job.finished_at = detail, True, datetime.now(UTC)
+        error_code = "OCR_FAILURE" if "OCR" in detail else "PARSER_FAILURE"
+        if not transition_extraction(
+            session, job_id, owner, status="failed", stage="failed", error_code=error_code,
+            error_detail=detail, retryable=True, finished_at=datetime.now(UTC),
+            owner_token=None, lease_expires_at=None,
+        ):
+            session.rollback()
+            session.expire_all()
+            return
         filing.status = "failed"
         session.query(ValidationResult).filter(
             ValidationResult.filing_version_id == filing_id,
@@ -523,9 +576,11 @@ def run_extraction(session: Session, job_id: int) -> None:
             tool_name="pymupdf",
             tool_version=PARSER_VERSION,
             input_hash=filing.file_sha256,
-            detail={"extraction_job_id": job_id, "error_code": job.error_code, "error": detail},
+            detail={"extraction_job_id": job_id, "error_code": error_code, "error": detail},
         )
         session.commit()
+        session.refresh(job)
     finally:
+        heartbeat.close()
         if document is not None:
             document.close()

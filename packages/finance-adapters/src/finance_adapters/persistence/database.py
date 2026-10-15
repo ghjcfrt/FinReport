@@ -16,7 +16,7 @@ SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
 
 def init_database() -> None:
-    from . import models  # noqa: F401
+    from . import models
 
     Base.metadata.create_all(engine)
     # Development databases predate some audit columns. Apply additive changes
@@ -24,7 +24,10 @@ def init_database() -> None:
     additions = {
         "companies": {"business_model_tags": "JSON"},
         "filing_versions": {"source_priority": "INTEGER DEFAULT 3"},
-        "extraction_jobs": {"retry_count": "INTEGER DEFAULT 0"},
+        "extraction_jobs": {
+            "retry_count": "INTEGER DEFAULT 0", "queued_at": "DATETIME",
+            "owner_token": "VARCHAR(64)", "lease_expires_at": "DATETIME",
+        },
         "evidence_fragments": {"extractor": "VARCHAR(128) DEFAULT 'pymupdf-text-v1'"},
         "analysis_runs": {
             "orchestration_version": "VARCHAR(64) DEFAULT 'analysis-v1'",
@@ -49,6 +52,9 @@ def init_database() -> None:
             for name, definition in columns.items():
                 if name not in existing:
                     connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {definition}"))
+    for model in (models.FactDimension, models.EvidenceFragment):
+        for index in model.__table__.indexes:
+            index.create(engine, checkfirst=True)
 
 
 def get_session():

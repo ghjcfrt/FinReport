@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 
@@ -30,6 +31,31 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_optional_bool(name: str) -> bool | None:
+    value = os.getenv(name, "").strip().lower()
+    if not value:
+        return None
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be true or false")
+
+
+def _env_positive_float(name: str, default: float) -> float:
+    value = float(os.getenv(name, str(default)))
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be finite and positive")
+    return value
+
+
+def _env_structured_output_mode() -> str:
+    value = os.getenv("FINREPORT_LLM_STRUCTURED_OUTPUT_MODE", "json_object").strip().lower()
+    if value not in {"json_object", "json_schema"}:
+        raise ValueError("FINREPORT_LLM_STRUCTURED_OUTPUT_MODE must be json_object or json_schema")
+    return value
+
+
 class Settings:
     database_url = os.getenv("FINREPORT_DATABASE_URL", "sqlite:///./data/finreport.db")
     storage_dir = Path(os.getenv("FINREPORT_STORAGE_DIR", "./data/storage"))
@@ -38,6 +64,10 @@ class Settings:
     llm_base_url = os.getenv("FINREPORT_LLM_BASE_URL")
     llm_api_key = os.getenv("FINREPORT_LLM_API_KEY")
     llm_model = os.getenv("FINREPORT_LLM_MODEL")
+    llm_timeout_seconds = _env_positive_float("FINREPORT_LLM_TIMEOUT_SECONDS", 120.0)
+    llm_enable_thinking = _env_optional_bool("FINREPORT_LLM_ENABLE_THINKING")
+    llm_reasoning_effort = os.getenv("FINREPORT_LLM_REASONING_EFFORT", "").strip() or None
+    llm_structured_output_mode = _env_structured_output_mode()
     ocr_provider = os.getenv("FINREPORT_OCR_PROVIDER", "openai")
     ocr_base_url = os.getenv("FINREPORT_OCR_BASE_URL", llm_base_url or "")
     ocr_api_key = os.getenv("FINREPORT_OCR_API_KEY", llm_api_key or "")

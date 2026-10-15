@@ -2,6 +2,7 @@ using System.IO;
 using System.Globalization;
 using System.Text.Json;
 using System.Collections.ObjectModel;
+using System.Windows;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using FinReport.Desktop.Services;
@@ -29,10 +30,16 @@ public partial class MainViewModel(FinReportApiClient api) : ObservableObject
     [ObservableProperty] private string reviewerId = "";
     [ObservableProperty] private string reviewReason = "";
     [ObservableProperty] private string correctedAmount = "";
-    [ObservableProperty] private FactItem? selectedFact;
+    [ObservableProperty] private FactRowView? selectedFact;
     [ObservableProperty] private string validationMessage = "校验：未执行";
     [ObservableProperty] private string analysisSummary = "分析：未生成";
-    public ObservableCollection<FactItem> Facts { get; } = [];
+    public ObservableCollection<FactRowView> Facts { get; } = [];
+    public ObservableCollection<int> OriginalTablePages { get; } = [];
+    public ObservableCollection<OriginalTableView> OriginalTables { get; } = [];
+    [ObservableProperty] private int? selectedTablePage;
+    [ObservableProperty] private OriginalTableView? selectedOriginalTable;
+    [ObservableProperty] private string originalTableSummary = "原表：请先上传并解析财报。";
+    private OriginalTableView[] _originalTables = [];
     [ObservableProperty] private string reviewSummary = "待复核：未加载";
     [ObservableProperty] private string metricsSummary = "指标：未计算";
     [ObservableProperty] private string exportSummary = "导出：未生成";
@@ -53,6 +60,7 @@ public partial class MainViewModel(FinReportApiClient api) : ObservableObject
     public ObservableCollection<string> OcrModels { get; } = [];
     private long _filingId;
     private long _jobId;
+    private CancellationTokenSource? _extractionCancellation;
 
     public bool CanSubmit => !IsBusy && File.Exists(SelectedFilePath) && !string.IsNullOrWhiteSpace(StockCode) && !string.IsNullOrWhiteSpace(CompanyName) && ReportYear is >= 1900 and <= 2100;
 
@@ -61,6 +69,16 @@ public partial class MainViewModel(FinReportApiClient api) : ObservableObject
     partial void OnCompanyNameChanged(string value) => OnPropertyChanged(nameof(CanSubmit));
     partial void OnReportYearChanged(int value) => OnPropertyChanged(nameof(CanSubmit));
     partial void OnIsBusyChanged(bool value) => OnPropertyChanged(nameof(CanSubmit));
+
+    partial void OnSelectedTablePageChanged(int? value)
+    {
+        var selectedId = SelectedOriginalTable?.Id;
+        OriginalTables.Clear();
+        foreach (var table in _originalTables.Where(table => table.PageNo == value))
+            OriginalTables.Add(table);
+        SelectedOriginalTable = OriginalTables.FirstOrDefault(table => table.Id == selectedId)
+            ?? OriginalTables.FirstOrDefault();
+    }
 
     public async Task LoadModelSettingsAsync(CancellationToken cancellationToken = default)
     {
@@ -220,39 +238,58 @@ public partial class MainViewModel(FinReportApiClient api) : ObservableObject
         Progress = 0;
         CanStartAnalysis = false;
         Facts.Clear();
+        _originalTables = [];
+        OriginalTablePages.Clear();
+        OriginalTables.Clear();
+        SelectedTablePage = null;
+        SelectedOriginalTable = null;
+        OriginalTableSummary = "原表：等待解析。";
         MetricsSummary = "指标：等待事实复核";
         AnalysisSummary = "分析：未生成";
         ExportSummary = "导出：未生成";
         try
         {
             StatusMessage = "正在上传…";
-            using var cancellation = new CancellationTokenSource(TimeSpan.FromMinutes(15));
+            using var cancellation = BeginExtractionTracking();
             var filingId = await api.UploadAsync(SelectedFilePath, StockCode, CompanyName, ReportYear, cancellation.Token);
             _filingId = filingId;
             var jobId = await api.StartJobAsync(filingId, cancellation.Token);
             _jobId = jobId;
-            while (true)
-            {
-                var job = await api.GetJobAsync(jobId, cancellation.Token);
-                Progress = job.Progress;
-                StatusMessage = $"阶段：{job.Stage}；状态：{job.Status}；待复核：{job.ReviewCount}";
-                if (job.Status is "completed" or "failed" or "cancelled")
-                {
-                    ErrorMessage = job.ErrorDetail ?? "";
-                    if (job.Status == "completed")
-                    {
-                        await RefreshFactsAsync(cancellation.Token);
-                        StatusMessage = "解析完成，请逐项核对原文，由两名独立复核人确认后计算指标。";
-                    }
-                    await RefreshAuditTrailAsync(cancellation.Token);
-                    break;
-                }
-                await Task.Delay(TimeSpan.FromSeconds(1), cancellation.Token);
-            }
+            await TrackExtractionAsync(jobId, cancellation.Token);
         }
         catch (OperationCanceledException) { ErrorMessage = "请求已取消或超时。"; }
         catch (Exception ex) { ErrorMessage = ex.Message; }
-        finally { IsBusy = false; }
+        finally { _extractionCancellation = null; IsBusy = false; }
+    }
+
+    private CancellationTokenSource BeginExtractionTracking()
+    {
+        _extractionCancellation?.Cancel();
+        var cancellation = new CancellationTokenSource(TimeSpan.FromMinutes(15));
+        _extractionCancellation = cancellation;
+        return cancellation;
+    }
+
+    private async Task TrackExtractionAsync(long jobId, CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            var job = await api.GetJobAsync(jobId, cancellationToken);
+            Progress = job.Progress;
+            StatusMessage = $"阶段：{job.Stage}；状态：{job.Status}；待复核：{job.ReviewCount}";
+            if (job.Status is "completed" or "failed" or "cancelled")
+            {
+                ErrorMessage = job.ErrorDetail ?? "";
+                if (job.Status == "completed")
+                {
+                    await RefreshFactsAsync(cancellationToken);
+                    StatusMessage = "解析完成，请逐项核对原文，由两名独立复核人确认后计算指标。";
+                }
+                await RefreshAuditTrailAsync(cancellationToken);
+                return;
+            }
+            await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
+        }
     }
 
     [RelayCommand]
@@ -284,7 +321,40 @@ public partial class MainViewModel(FinReportApiClient api) : ObservableObject
     }
 
     [RelayCommand]
-    private async Task RefreshFactsAsync() => await RefreshFactsAsync(CancellationToken.None);
+    private async Task RefreshFactsAsync()
+    {
+        try { await RefreshFactsAsync(CancellationToken.None); }
+        catch (Exception ex) { ErrorMessage = $"读取事实与原表失败：{ex.Message}"; }
+    }
+
+    [RelayCommand]
+    private async Task RefreshOriginalTablesAsync()
+    {
+        try { await RefreshOriginalTablesAsync(CancellationToken.None); }
+        catch (Exception ex) { OriginalTableSummary = $"读取原表失败：{ex.Message}"; }
+    }
+
+    private async Task RefreshOriginalTablesAsync(CancellationToken cancellationToken)
+    {
+        if (_filingId == 0) return;
+        var selectedPage = SelectedTablePage;
+        var selectedId = SelectedOriginalTable?.Id;
+        var tables = await api.GetTablesAsync(_filingId, cancellationToken);
+        _originalTables = tables.OrderBy(table => table.PageNo).ThenBy(table => table.Id)
+            .Select(table => new OriginalTableView(table)).ToArray();
+        OriginalTablePages.Clear();
+        foreach (var page in _originalTables.Select(table => table.PageNo).Distinct())
+            OriginalTablePages.Add(page);
+        SelectedTablePage = selectedPage is int current && OriginalTablePages.Contains(current)
+            ? current : OriginalTablePages.Cast<int?>().FirstOrDefault();
+        // Refresh the table list even if the selected page number did not change.
+        OnSelectedTablePageChanged(SelectedTablePage);
+        SelectedOriginalTable = OriginalTables.FirstOrDefault(table => table.Id == selectedId)
+            ?? OriginalTables.FirstOrDefault();
+        OriginalTableSummary = tables.Length == 0
+            ? "原表：尚无可展示的表格候选。"
+            : $"原表：{tables.Length} 张，覆盖 {OriginalTablePages.Count} 页。只读展示，不作为已核验事实。";
+    }
 
     private async Task RefreshFactsAsync(CancellationToken cancellationToken)
     {
@@ -292,12 +362,13 @@ public partial class MainViewModel(FinReportApiClient api) : ObservableObject
         var selectedId = SelectedFact?.Id;
         var facts = await api.GetFactsAsync(_filingId, cancellationToken);
         Facts.Clear();
-        foreach (var fact in facts) Facts.Add(fact);
+        foreach (var fact in facts) Facts.Add(new FactRowView(fact));
         SelectedFact = Facts.FirstOrDefault(f => f.Id == selectedId);
         ReviewSummary = $"事实：{facts.Length} 条；待复核：{facts.Count(f => f.ReviewStatus != "verified")} 条";
         var validation = await api.GetValidationsAsync(_filingId, cancellationToken);
         ValidationMessage = $"财报状态：{validation.FilingStatus}；" + string.Join("；", validation.Results.Select(r => $"{r.RuleCode}: {r.Status}（{r.ActualValue}）"));
         CanStartAnalysis = false;
+        await RefreshOriginalTablesAsync(cancellationToken);
     }
 
     [RelayCommand] private async Task ConfirmFactAsync() => await ReviewSelectedAsync("confirmed");
@@ -343,16 +414,33 @@ public partial class MainViewModel(FinReportApiClient api) : ObservableObject
     [RelayCommand]
     private async Task RetryAsync()
     {
-        if (_jobId == 0) return;
-        try { await api.RetryJobAsync(_jobId, CancellationToken.None); StatusMessage = "已重新提交任务"; }
+        if (_jobId == 0 || IsBusy) return;
+        IsBusy = true;
+        ErrorMessage = "";
+        CanStartAnalysis = false;
+        try
+        {
+            using var cancellation = BeginExtractionTracking();
+            await api.RetryJobAsync(_jobId, cancellation.Token);
+            StatusMessage = "已重新提交任务";
+            await TrackExtractionAsync(_jobId, cancellation.Token);
+        }
+        catch (OperationCanceledException) { ErrorMessage = "任务跟踪已取消或超时。"; }
         catch (Exception ex) { ErrorMessage = ex.Message; }
+        finally { _extractionCancellation = null; IsBusy = false; }
     }
 
     [RelayCommand]
     private async Task CancelAsync()
     {
         if (_jobId == 0) return;
-        try { await api.CancelJobAsync(_jobId, CancellationToken.None); StatusMessage = "已请求取消任务"; }
+        try
+        {
+            await api.CancelJobAsync(_jobId, CancellationToken.None);
+            _extractionCancellation?.Cancel();
+            StatusMessage = "已取消任务";
+            await RefreshAuditTrailAsync(CancellationToken.None);
+        }
         catch (Exception ex) { ErrorMessage = ex.Message; }
     }
 
@@ -399,4 +487,124 @@ public partial class MainViewModel(FinReportApiClient api) : ObservableObject
         }
         catch (Exception ex) { ErrorMessage = $"读取执行审计记录失败：{ex.Message}"; }
     }
+}
+
+public sealed record FactRowView(FactItem Fact)
+{
+    public long Id => Fact.Id;
+    public string ReviewStatus => Fact.ReviewStatus;
+    public string ConceptName => Fact.ConceptName;
+    public SourceLabelView Label => new(string.IsNullOrEmpty(Fact.Evidence?.RawLabel)
+        ? Fact.ConceptName : Fact.Evidence.RawLabel, Fact.Evidence?.BoundingBox?.LabelLayout);
+    public string AmountDisplay => Fact.AmountDisplay;
+    public string SourceDisplay => Fact.SourceDisplay;
+}
+
+public sealed class OriginalTableView
+{
+    private static readonly HashSet<string> KnownNames = [
+        "合并资产负债表", "合并利润表", "合并现金流量表",
+        "母公司资产负债表", "母公司利润表", "母公司现金流量表",
+        "资产负债表", "利润表", "现金流量表",
+    ];
+
+    public OriginalTableItem Source { get; }
+    public long Id => Source.Id;
+    public int PageNo => Source.PageNo;
+    public string DisplayName => Source.TableName is string name && KnownNames.Contains(name)
+        ? name : "原表候选";
+    public string SelectionLabel => $"{DisplayName} · 第 {PageNo} 页 · 表 {Id}";
+    public string Metadata => $"第 {PageNo} 页 / {DisplayName} / {Rows.Length} 行 · "
+        + (Source.ReviewRequired ? "待核对候选" : "原表候选")
+        + (Source.Confidence is decimal confidence ? $" · 提取置信度 {confidence:P0}" : "");
+    public string SourceDetail => $"提取器：{Source.Extractor ?? "未记录"}；页指纹：{Source.PageSha256 ?? "未记录"}；"
+        + $"原始表名：{Source.TableName ?? "未记录"}";
+    public string FirstColumnHeading { get; }
+    public string[] AdditionalColumnHeadings { get; }
+    public OriginalTableRowView[] Rows { get; }
+
+    public OriginalTableView(OriginalTableItem source)
+    {
+        Source = source;
+        var rows = source.Rows ?? [];
+        var columns = source.Columns ?? [];
+        var width = Math.Max(columns.Length, rows.Select(row => row.Cells?.Length ?? 0).DefaultIfEmpty().Max());
+        FirstColumnHeading = columns.FirstOrDefault() is string first && !string.IsNullOrWhiteSpace(first)
+            ? first : "项目";
+        AdditionalColumnHeadings = Enumerable.Range(1, Math.Max(0, width - 1))
+            .Select(index => index < columns.Length && !string.IsNullOrWhiteSpace(columns[index])
+                ? columns[index] : $"列 {index + 1}").ToArray();
+        Rows = rows.Select(row => new OriginalTableRowView(row, width)).ToArray();
+    }
+}
+
+public sealed class OriginalTableRowView
+{
+    public OriginalTableRow Source { get; }
+    public SourceLabelView Label { get; }
+    public string LayoutDetail => Source.LabelLayout is LabelLayout layout
+        ? $"原文缩进 {layout.IndentPoints?.ToString("0.###", CultureInfo.InvariantCulture) ?? "未记录"} 点；标签起点 {layout.LabelStartX?.ToString("0.###", CultureInfo.InvariantCulture) ?? "未记录"} 点"
+        : "此候选未记录科目几何位置；按原始单元格平铺展示。";
+    public OriginalCellView[] AdditionalCells { get; }
+
+    public OriginalTableRowView(OriginalTableRow source, int width)
+    {
+        Source = source;
+        Label = new SourceLabelView(source.RawLabel ?? source.Cells?.FirstOrDefault() ?? "", source.LabelLayout);
+        var cells = source.Cells ?? [];
+        AdditionalCells = Enumerable.Range(1, Math.Max(0, width - 1))
+            .Select(index => index < cells.Length
+                ? new OriginalCellView(cells[index], false) : new OriginalCellView("—", true)).ToArray();
+    }
+}
+
+public sealed class SourceLabelView
+{
+    private readonly LabelLayout? _layout;
+    public string RawLabel { get; }
+    public string Prefix { get; }
+    public string Body { get; }
+    public Thickness PrefixMargin { get; }
+    public Thickness BodyMargin { get; }
+    public Thickness RawMargin { get; }
+    public double FontSize { get; }
+    public Visibility GeometryVisibility { get; }
+    public Visibility PlainVisibility => GeometryVisibility == Visibility.Visible
+        ? Visibility.Collapsed : Visibility.Visible;
+
+    public SourceLabelView(string rawLabel, LabelLayout? layout)
+    {
+        RawLabel = rawLabel;
+        _layout = layout;
+        Prefix = layout?.Prefix ?? "";
+        var labelX = layout?.LabelStartX;
+        var bodyX = layout?.BodyStartX;
+        var origin = layout?.TableOriginX;
+        if (origin is null && labelX is double start && layout?.IndentPoints is double indent)
+            origin = start - indent;
+        var hasCoordinates = labelX is double lx && double.IsFinite(lx)
+            && bodyX is double bx && double.IsFinite(bx)
+            && origin is double ox && double.IsFinite(ox)
+            && bx >= lx && (Prefix.Length == 0 || bx > lx)
+            && layout?.Source != "pdf_span_bbox_fallback"
+            && (Prefix.Length == 0 || rawLabel.StartsWith(Prefix, StringComparison.Ordinal));
+        Body = hasCoordinates && Prefix.Length > 0 ? rawLabel[Prefix.Length..].TrimStart() : rawLabel;
+        GeometryVisibility = hasCoordinates ? Visibility.Visible : Visibility.Collapsed;
+        PrefixMargin = new Thickness(hasCoordinates ? Offset(labelX!.Value, origin!.Value) : 0, 0, 0, 0);
+        BodyMargin = new Thickness(hasCoordinates ? Offset(bodyX!.Value, origin!.Value) : 0, 0, 0, 0);
+        RawMargin = new Thickness(layout?.IndentDip ?? 0, 0, 0, 0);
+        FontSize = layout?.FontSize is double size && double.IsFinite(size) && size > 0
+            ? size * 96.0 / 72.0 : 12;
+    }
+
+    private static double Offset(double x, double origin) => Math.Max(0, x - origin) * 96.0 / 72.0;
+    public string LayoutDetail => _layout is null ? "未记录原文几何位置；按原文科目平铺展示。"
+        : $"原文标签起点 {_layout.LabelStartX?.ToString("0.###", CultureInfo.InvariantCulture) ?? "未记录"} 点；"
+          + $"正文起点 {_layout.BodyStartX?.ToString("0.###", CultureInfo.InvariantCulture) ?? "未记录"} 点；"
+          + $"表格起点 {_layout.TableOriginX?.ToString("0.###", CultureInfo.InvariantCulture) ?? "未记录"} 点";
+}
+
+public sealed record OriginalCellView(string Value, bool Missing)
+{
+    public string Detail => Missing ? "原始输出缺少此单元格；未补值。" : Value;
 }

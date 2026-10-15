@@ -40,6 +40,31 @@ tmp/
 tmp_*/
 tests/**/.runtime/
 
+# Local tests and financial-report samples (already tracked files stay tracked)
+/tests/
+/tools/test-*.py
+/docs/*.[pP][dD][fF]
+
+# Local OCR experiments and their generated comparison notes
+/tools/compare-table-ocr.py
+/tools/ocr-requirements.txt
+/tools/ocr_comparison.py
+/tools/ocr_comparison_report.py
+/tools/ocr_table_engines.py
+/tools/profile-pdf-text.py
+/tools/run-ocr-comparison.ps1
+/docs/ocr-table-comparison.md
+/docs/deepseek-gpt4omini-comparison.md
+/docs/pdf-text-extraction-feasibility.md
+/docs/analysis-remediation-and-competition-audit-*.md
+/TOOD
+
+# Generated local code-intelligence database and agent instructions
+/.gitnexus/
+/.claude/
+/AGENTS.md
+/CLAUDE.md
+
 # IDE, OS, and tool metadata
 .history/
 .idea/

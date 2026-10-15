@@ -3,6 +3,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 
+from finance_domain.metrics.formulas import free_cash_flow
+
+
+def is_financial_industry(code: str) -> bool:
+    """Known financial sectors; unknown labels are not silently reclassified."""
+    return code.strip().lower() in {
+        "bank", "insurance", "broker", "finance", "j", "j66", "j67", "j68", "j69",
+        "金融业", "货币金融服务", "资本市场服务", "保险业", "其他金融业",
+    }
+
 
 @dataclass(frozen=True)
 class MetricFormula:
@@ -18,6 +28,11 @@ class MetricFormula:
             return inputs[0]
         if self.operation == "difference":
             return inputs[0] - inputs[1]
+        if self.operation == "free_cash_flow":
+            value, issue = free_cash_flow(inputs[0], inputs[1])
+            if issue:
+                raise ValueError(issue)
+            return value
         if self.operation == "gross_margin":
             if inputs[0] <= 0:
                 raise ValueError("NON_POSITIVE_REVENUE")
@@ -57,6 +72,6 @@ METRIC_DEFINITIONS = {
     ),
     "free_cash_flow": MetricFormula(
         "自由现金流", "cashflow_operations - capex_cash",
-        ("cashflow_operations", "capex_cash"), "currency", "difference"
+        ("cashflow_operations", "capex_cash"), "currency", "free_cash_flow"
     ),
 }

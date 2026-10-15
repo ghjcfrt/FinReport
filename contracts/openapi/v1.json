@@ -5,6 +5,43 @@
     "version": "1.0.0"
   },
   "paths": {
+    "/api/v1/filings/{filing_version_id}/period-comparison": {
+      "get": {
+        "summary": "Period Comparison",
+        "operationId": "period_comparison_api_v1_filings__filing_version_id__period_comparison_get",
+        "parameters": [
+          {
+            "name": "filing_version_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Filing Version Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/health": {
       "get": {
         "summary": "Health",
@@ -444,6 +481,61 @@
         }
       }
     },
+    "/api/v1/filings/{filing_version_id}/tables": {
+      "get": {
+        "summary": "List Tables",
+        "description": "Read complete candidate tables and measured visual indentation for review.",
+        "operationId": "list_tables_api_v1_filings__filing_version_id__tables_get",
+        "parameters": [
+          {
+            "name": "filing_version_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Filing Version Id"
+            }
+          },
+          {
+            "name": "page_no",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Page No"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/facts/{fact_id}/review": {
       "patch": {
         "summary": "Review Fact",
@@ -702,6 +794,43 @@
       "get": {
         "summary": "Get Analysis",
         "operationId": "get_analysis_api_v1_analyses__analysis_run_id__get",
+        "parameters": [
+          {
+            "name": "analysis_run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Analysis Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/analyses/{analysis_run_id}/reproduction": {
+      "get": {
+        "summary": "Export Reproduction",
+        "operationId": "export_reproduction_api_v1_analyses__analysis_run_id__reproduction_get",
         "parameters": [
           {
             "name": "analysis_run_id",
