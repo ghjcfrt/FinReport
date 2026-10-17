@@ -21,6 +21,7 @@ from fastapi import (
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse, JSONResponse
 from finance_adapters.config import settings
+from finance_adapters.exports.reasoning import provider_reasoning
 from finance_adapters.exports.report_renderer import generate_export
 from finance_adapters.parsing.pdf_parser import run_extraction
 from finance_adapters.persistence.audit import record_audit_event, stable_hash
@@ -60,6 +61,7 @@ from finance_adapters.persistence.peer_gateway import (
 )
 from finance_adapters.persistence.review_gateway import recompute_filing_quality
 from finance_adapters.providers.llm_analysis import build_evidence_package, run_analysis
+from finance_adapters.providers.model_clients import BaiduUnlimitedOCRAdapter
 from finance_adapters.providers.reproduction import build_reproduction_bundle
 from finance_adapters.security import ScanDisposition, database_update, scanner
 from finance_adapters.security.file_gate import scanned_object_path
@@ -75,14 +77,19 @@ from finance_domain.analysis.contracts import (
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
+from finreport_api.analysis_workflow_routes import router as analysis_workflow_router
 from finreport_api.annual_disclosure_routes import router as annual_disclosure_router
 from finreport_api.comparison_routes import router as comparison_router
 from finreport_api.ocr_mapping_routes import router as ocr_mapping_router
+from finreport_api.report_analysis_routes import AnalysisReasoningEnvelope
+from finreport_api.report_analysis_routes import router as report_analysis_router
 
 app = FastAPI(title="FinReport API", version="1.0.0")
 app.include_router(comparison_router)
 app.include_router(ocr_mapping_router)
 app.include_router(annual_disclosure_router)
+app.include_router(analysis_workflow_router)
+app.include_router(report_analysis_router)
 _recovery_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="extraction-recovery")
 _recovery_stop = Event()
 _recovery_thread: Thread | None = None
@@ -197,10 +204,19 @@ async def update_scanner_database(request: Request):
 
 @app.get("/api/v1/settings/models")
 def model_settings(request: Request):
+    ocr_is_baidu = BaiduUnlimitedOCRAdapter.matches(settings.ocr_provider)
+    ocr_requires_key = not ocr_is_baidu or (
+        BaiduUnlimitedOCRAdapter.resolve_protocol(settings.ocr_base_url, settings.ocr_protocol) == "baidu_cloud"
+    )
+    ocr_configured = bool(
+        settings.ocr_base_url and settings.ocr_model
+        and (settings.ocr_api_key or not ocr_requires_key)
+        and not BaiduUnlimitedOCRAdapter.is_retired_ocr(settings.ocr_provider, settings.ocr_model)
+    )
     return envelope(request, {
         "analysis": {"provider": settings.llm_provider, "base_url": settings.llm_base_url, "model": settings.llm_model, "configured": bool(settings.llm_base_url and settings.llm_api_key and settings.llm_model), "credentials_configured": bool(settings.llm_api_key)},
-        "ocr": {"provider": settings.ocr_provider, "base_url": settings.ocr_base_url, "model": settings.ocr_model, "configured": bool(settings.ocr_base_url and settings.ocr_api_key and settings.ocr_model), "credentials_configured": bool(settings.ocr_api_key)},
-        "supported_providers": ["openai", "anthropic"],
+        "ocr": {"provider": settings.ocr_provider, "base_url": settings.ocr_base_url, "model": settings.ocr_model, "protocol": settings.ocr_protocol, "configured": ocr_configured, "credentials_configured": bool(settings.ocr_api_key)},
+        "supported_providers": ["openai", "anthropic", "baidu-unlimited-ocr"],
         "secrets_managed_server_side": True,
     })
 
@@ -224,11 +240,15 @@ def update_model_settings(request: Request, payload: dict, session: Session = De
 def discover_models(request: Request, stage: str, payload: ModelDiscoveryRequest):
     if stage not in {"analysis", "ocr"}:
         raise HTTPException(404, "MODEL_STAGE_NOT_FOUND")
+    is_baidu_ocr = stage == "ocr" and BaiduUnlimitedOCRAdapter.matches(payload.provider)
+    if is_baidu_ocr and BaiduUnlimitedOCRAdapter.resolve_protocol(payload.base_url, settings.ocr_protocol) == "baidu_cloud":
+        # The managed parser has a fixed model and no OpenAI /models endpoint.
+        return envelope(request, {"models": ["baidu/Unlimited-OCR"], "discovery_source": "provider_catalog"})
     configured_key = settings.llm_api_key if stage == "analysis" else settings.ocr_api_key
     api_key = payload.api_key or configured_key
-    if not api_key:
+    if not api_key and not is_baidu_ocr:
         raise HTTPException(422, "API_KEY_REQUIRED_FOR_MODEL_DISCOVERY")
-    headers = {"Authorization": f"Bearer {api_key}"}
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     if payload.provider == "anthropic":
         headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01"}
     try:
@@ -389,6 +409,7 @@ def create_job(
     payload: ExtractionRequest | None = None,
 ):
     method = payload.extraction_method if payload else "pdf_text"
+    pages = payload.page_numbers if payload else None
     filing = get_filing(session, filing_version_id)
     try:
         scanned_object_path(session, filing)
@@ -405,6 +426,8 @@ def create_job(
     if existing:
         if existing.extraction_method != method:
             raise HTTPException(409, "EXTRACTION_METHOD_CONFLICT_WITH_ACTIVE_JOB")
+        if existing.page_numbers != pages:
+            raise HTTPException(409, "EXTRACTION_PAGE_RANGE_CONFLICT_WITH_ACTIVE_JOB")
         for recovered_id in recover_expired_extractions(session, existing.id):
             workflow_runtime.dispatch_extract(recovered_id, background)
         session.refresh(existing)
@@ -414,11 +437,12 @@ def create_job(
     latest = session.scalar(select(ExtractionJob).where(
         ExtractionJob.filing_version_id == filing.id,
     ).order_by(ExtractionJob.id.desc()).limit(1))
-    if latest and latest.status == "completed" and latest.extraction_method == method:
+    if (latest and latest.status == "completed" and latest.extraction_method == method
+            and latest.page_numbers == pages):
         return envelope(request, {"job_id": latest.id, "status": latest.status, "reused": True,
                                   "extraction_method": latest.extraction_method,
                                   "review_required": True})
-    job = ExtractionJob(filing_version_id=filing.id, extraction_method=method)
+    job = ExtractionJob(filing_version_id=filing.id, extraction_method=method, page_numbers=pages)
     queue_extraction(job)
     session.add(job)
     filing.status = "extracting"
@@ -438,12 +462,14 @@ def create_job(
     record_audit_event(
         session, filing.id, category="workflow", action="extraction_method_selected",
         status="queued", tool_name="extraction_lifecycle", tool_version="method-v1",
-        detail={"extraction_method": method, "review_required": True},
+        detail={"extraction_method": method, "page_numbers": pages,
+                "processing_scope": "selected_pages" if pages else "whole_document", "review_required": True},
     )
     session.commit()
     workflow_runtime.dispatch_extract(job.id, background)
     return envelope(request, {"job_id": job.id, "status": job.status, "reused": False,
-                              "extraction_method": job.extraction_method, "review_required": True})
+                              "extraction_method": job.extraction_method, "page_numbers": job.page_numbers,
+                              "review_required": True})
 
 
 def _background_extract(job_id: int) -> None:
@@ -982,7 +1008,7 @@ def _background_analysis(run_id: int) -> None:
 workflow_runtime = WorkflowRuntime(extract=_background_extract, analyze=_background_analysis)
 
 
-@app.get("/api/v1/analyses/{analysis_run_id}")
+@app.get("/api/v1/analyses/{analysis_run_id}", response_model=AnalysisReasoningEnvelope)
 def get_analysis(request: Request, analysis_run_id: int, session: Session = Depends(get_session)):
     run = session.get(AnalysisRun, analysis_run_id)
     if run is None:
@@ -1000,6 +1026,7 @@ def get_analysis(request: Request, analysis_run_id: int, session: Session = Depe
             "orchestration_version": run.orchestration_version,
             "tool_trace": run.tool_trace,
             "invalidated_at": run.invalidated_at,
+            "provider_reasoning": provider_reasoning(run.tool_trace),
         },
     )
 

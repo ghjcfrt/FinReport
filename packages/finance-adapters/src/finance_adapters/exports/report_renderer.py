@@ -14,6 +14,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from finance_adapters.config import settings
+from finance_adapters.exports.reasoning import provider_reasoning
+from finance_adapters.persistence.audit import stable_hash
 from finance_adapters.persistence.metric_gateway import (
     FORMULA_VERSION,
     _snapshot,
@@ -29,6 +31,7 @@ from finance_adapters.persistence.models import (
     FinancialFact,
     MetricResult,
 )
+from finance_adapters.providers.analysis_agent import current_workflow_snapshot
 from finance_adapters.providers.llm_analysis import (
     _hash,
     build_evidence_package,
@@ -71,6 +74,8 @@ th {font-weight:bold}
 .claim {margin-bottom:14pt}
 .evidence {font-size:9pt}
 footer {margin-top:22pt;font-size:9pt;color:#4b5563}
+details {margin-top:8pt;margin-bottom:8pt}
+pre.reasoning {white-space:pre-wrap;overflow-wrap:anywhere;font:9pt Arial,'Microsoft YaHei',sans-serif}
 """
 
 
@@ -137,7 +142,7 @@ def _validated_inputs(session: Session, filing_id: int):
         select(AnalysisRun)
         .where(
             AnalysisRun.filing_version_id == filing_id,
-            AnalysisRun.status == "completed",
+            AnalysisRun.status.in_(["completed", "partial_result", "waiting_for_documents"]),
             AnalysisRun.invalidated_at.is_(None),
         )
         .order_by(AnalysisRun.id.desc())
@@ -178,6 +183,10 @@ def _validated_inputs(session: Session, filing_id: int):
         raise ValueError(f"EXPORT_EVIDENCE_PACKAGE_INVALID:{exc}") from exc
     if _hash(package) != analysis.input_snapshot_hash:
         raise ValueError("EXPORT_INPUT_SNAPSHOT_CHANGED")
+    if output.agent_workflow is not None and stable_hash(
+        current_workflow_snapshot(session, filing)
+    ) != output.agent_workflow.document_snapshot_hash:
+        raise ValueError("EXPORT_DOCUMENT_SNAPSHOT_CHANGED")
     try:
         validate_analysis_output(analysis.output, package)
     except ValueError as exc:
@@ -195,6 +204,154 @@ def _validated_inputs(session: Session, filing_id: int):
     ):
         raise ValueError("EXPORT_ANALYSIS_EVIDENCE_UNAVAILABLE")
     return filing, metrics, analysis, output, facts, evidence_ids, package
+
+
+def _render_workflow_html(workflow) -> str:
+    if workflow is None:
+        return ""
+    topics = {"non_recurring_items": "非经常性损益", "accounting_basis_changes": "会计口径变化",
+              "profit_cashflow_relationship": "利润与经营现金流关系", "performance_changes": "业绩变化"}
+    kinds = {"program_fact": "程序确认的事实", "company_disclosure": "公司原文披露",
+             "analysis_inference": "分析推断", "evidence_insufficient": "证据不足的判断"}
+    statuses = {"completed": "完成", "partial_result": "部分结果", "waiting_for_documents": "等待补充材料"}
+    source_map = {item["id"]: item for item in workflow.sources}
+    checks = "".join(
+        f"<tr><td>{_escape(topics.get(item.topic, item.topic))}</td><td>{_escape(item.status)}</td>"
+        f"<td>{_escape(item.coverage_note)}"
+        f"{('<ul>' + ''.join('<li>' + _escape(obligation.get('label', obligation.get('id'))) + '：' + _escape(obligation.get('status')) + '；' + _escape(obligation.get('reason')) + '</li>' for obligation in item.obligations) + '</ul>') if item.obligations else ''}"
+        f"</td></tr>" for item in workflow.mandatory_checks
+    )
+    findings = []
+    for item in workflow.findings:
+        references = []
+        for source_id in item.source_ids:
+            source = source_map.get(source_id, {})
+            references.append(
+                f"<li>来源 {_escape(source_id)}；文件 {_escape(source.get('filing_version_id'))}，"
+                f"第 {_escape(source.get('page_no'))} 页；审核状态 {_escape(source.get('review_status', 'unknown'))}。"
+                f"<br>{_escape(source.get('text', '')).replace(chr(10), '<br>')}"
+                f"<br>原文 SHA-256：{_escape(source.get('text_sha256'))}</li>"
+            )
+        obligation_label = getattr(item, "obligation_id", None)
+        obligation_text = f" · 子命题 {_escape(obligation_label)}" if obligation_label else ""
+        item_assessments = []
+        for assessment in getattr(item, "evidence_item_assessments", None) or []:
+            value = assessment.model_dump() if hasattr(assessment, "model_dump") else assessment
+            item_assessments.append(
+                f"<li>清单项 {_escape(value.get('item_id'))}；处置 {_escape(value.get('status'))}："
+                f"{_escape(value.get('reason'))}</li>"
+            )
+        item_assessment_html = ("<h4>逐项处置依据</h4><ul>" + "".join(item_assessments) + "</ul>"
+                                if item_assessments else "")
+        findings.append(
+            f"<div class='claim'><h3>{_escape(topics.get(item.topic, item.topic))}{obligation_text} · "
+            f"{_escape(kinds.get(item.evidence_kind, item.evidence_kind))}</h3>"
+            f"<p>{_escape(item.statement)}</p><p>依据与判断边界：{_escape(item.rationale)}</p>"
+            f"<p class='meta'>判断类别：{_escape(item.assessment)}；"
+            f"计算引用：{_escape(item.calculation_ids)}；指标引用：{_escape(item.metric_result_ids)}</p>"
+            f"<ul>{''.join(references)}</ul>{item_assessment_html}</div>"
+        )
+    requirements = "".join(
+        f"<li>{_escape(topics.get(item.topic, item.topic))}：{_escape(item.purpose)}；"
+        f"期间 {_escape(item.period_start)} 至 {_escape(item.period_end)}；"
+        f"所需科目：{_escape(item.concept_codes)}；状态：{_escape(item.status)}；"
+        f"可接受替代材料：{_escape('；'.join(item.acceptable_alternatives))}</li>"
+        for item in workflow.material_requirements
+    ) or "<li>当前没有登记待补材料。</li>"
+    calculations = "".join(
+        f"<li>计算 {_escape(item.get('id'))}：{_escape(item)}</li>" for item in workflow.calculations
+    ) or "<li>本轮没有新增比较计算；不能据此推定没有财务异常。</li>"
+    return (
+        f"<h2>多轮财务分析：{_escape(statuses.get(workflow.status, workflow.status))}</h2>"
+        f"<p>停止原因：{_escape(workflow.stop_reason)}；已执行 {_escape(workflow.completed_rounds)} 轮。</p>"
+        f"<table><tr><th>必查主题</th><th>状态</th><th>证据覆盖与限制</th></tr>{checks}</table>"
+        + _render_evidence_coverage_html(getattr(workflow, "evidence_coverage", None))
+        + "".join(findings)
+        + f"<h3>比较计算与输入依据</h3><ul>{calculations}</ul>"
+        + f"<h3>补充材料与待审核事项</h3><ul>{requirements}</ul>"
+        + f"<p class='meta'>检查点：{_escape(workflow.checkpoint_id)}；材料快照 SHA-256："
+        f"{_escape(workflow.document_snapshot_hash)}。仅对已执行检查和已读取证据声明分析范围。</p>"
+    )
+
+
+def _render_evidence_coverage_html(coverage: dict | None) -> str:
+    if not isinstance(coverage, dict):
+        return ""
+    manifest = coverage.get("manifest") or {}
+    states = {item.get("item_id"): item for item in coverage.get("item_states", [])}
+    pending = set(coverage.get("pending_item_ids", []))
+    rows = []
+    for item in manifest.get("items", []):
+        state = states.get(item.get("id"), {})
+        period = item.get("period") or {}
+        period_label = f"{period.get('period_start') or 'unknown'} 至 {period.get('period_end') or 'unknown'}"
+        quoted_ids = state.get("presented_finding_ids", [])
+        disposition_ids = state.get("assessment_finding_ids", [])
+        disposition = "、".join(state.get("disposition_statuses", [])) or "pending（未逐项处置）"
+        if item.get("id") in pending:
+            disposition += "；pending（原文呈现或逐项处置待补）"
+        references = "；".join(
+            f"{ref.get('source_id')} · 第 {ref.get('page_no')} 页" for ref in item.get("source_refs", [])
+        )
+        rows.append(
+            f"<tr><td>{_escape(item.get('raw_label'))}<br><span class='meta'>{_escape(item.get('id'))}</span></td>"
+            f"<td>{_escape(item.get('raw_amount') if item.get('raw_amount') is not None else 'unknown')}</td>"
+            f"<td>{_escape(period_label)}<br>{_escape(item.get('column_label') or 'unknown')}</td>"
+            f"<td>{_escape(item.get('unit') or 'unknown（原单位未定位）')}</td>"
+            f"<td>{'是' if state.get('ever_sent') else '否'}；当前可见：{'是' if state.get('currently_visible') else '否'}</td>"
+            f"<td>{'是' if quoted_ids else '否'}<br>{_escape('、'.join(quoted_ids))}</td>"
+            f"<td>{_escape(disposition)}<br>{_escape('、'.join(disposition_ids))}</td>"
+            f"<td>{_escape(state.get('review_status', item.get('review_status', 'unknown')))}"
+            f"<br>文件 {_escape(item.get('filing_version_id'))}；{_escape(references)}</td></tr>"
+        )
+    issues = []
+    for group in manifest.get("groups", []):
+        problems = "；".join(group.get("issues", [])) or "当前取证表格范围未登记闭合问题"
+        issues.append(
+            f"<li>文件 {_escape(group.get('filing_version_id'))}；清单状态 {_escape(group.get('status'))}；"
+            f"原单位状态 {_escape(group.get('unit_status', 'unknown'))}；{_escape(problems)}"
+            f"<br>表内核对：{_escape(group.get('reconciliation', []))}</li>"
+        )
+    verified = "通过" if coverage.get("manifest_verified") else "未通过（分母尚不可靠）"
+    ratio = coverage.get("coverage_ratio")
+    ratio_label = (f"{ratio:.1%}" if coverage.get("manifest_verified")
+                   and isinstance(ratio, (float, int)) else "不可计算")
+    return (
+        "<details><summary>逐项证据呈现与处置清单</summary>"
+        f"<p>清单 {_escape(coverage.get('required_count', 0))} 项；原文呈现 {_escape(coverage.get('presented_count', 0))} 项；"
+        f"显式处置 {_escape(coverage.get('explicitly_addressed_count', 0))} 项；待补 {len(pending)} 项。"
+        f"表格闭合检查：{verified}；呈现及处置覆盖率：{_escape(ratio_label)}。</p>"
+        f"<p>逐项讨论 {_escape(coverage.get('discussed_count', 0))} 项；"
+        f"明确证据不足 {_escape(coverage.get('insufficient_evidence_count', 0))} 项；"
+        f"语义核验状态：{_escape(coverage.get('semantic_analysis_status', 'requires_semantic_review'))}（仍须复核）。</p>"
+        "<p class='meta'>覆盖率仅度量可观察的原文呈现和逐项处置，不代表模型内部理解或财务人工审核通过。"
+        "逐项原文引用按完整原文行呈现统计；来源页的泛引用不算逐项引用。原单位 unknown 时不得自动换算。</p>"
+        "<table><tr><th>原文项目</th><th>原金额</th><th>期间与原列名</th><th>原单位</th>"
+        "<th>已发给模型</th><th>逐项原文引用</th><th>逐项处置</th><th>审核状态与来源</th></tr>"
+        + "".join(rows) + "</table><h4>清单闭合问题与表内核对</h4><ul>"
+        + "".join(issues) + "</ul>"
+        f"<p class='meta'>清单 SHA-256：{_escape(coverage.get('manifest_hash'))}；"
+        f"{_escape(coverage.get('boundary', '仅覆盖已取证范围，仍须人工复核。'))}</p></details>"
+    )
+
+
+def _render_reasoning_html(trace: dict) -> str:
+    projection = provider_reasoning(trace)
+    if not projection["calls"]:
+        return "<h3>供应商返回的思考文本</h3><p>尚无已保存的模型调用。</p>"
+    blocks = []
+    labels = {"returned": "已返回思考文本", "disabled": "本次请求已关闭思考；未返回思考正文",
+              "not_returned": "供应商未返回思考正文"}
+    for call in projection["calls"]:
+        fields = "".join(
+            f"<p class='meta'>字段：{_escape(field['field'])}</p>"
+            f"<pre class='reasoning'>{_escape(field['content'])}</pre>" for field in call["fields"]
+        )
+        blocks.append(
+            f"<details><summary>{_escape(call['stage'])} · 第 {call['call_index']} 次 · "
+            f"{labels[call['status']]}</summary>{fields}</details>"
+        )
+    return "<h3>供应商返回的思考文本</h3>" + "".join(blocks)
 
 
 def _render_html(
@@ -251,6 +408,7 @@ def _render_html(
     )
     limitations = "".join(f"<li>{_escape(item)}</li>" for item in output.limitations)
     trace = analysis.tool_trace or {}
+    reasoning_html = _render_reasoning_html(trace)
     attempts = trace.get("attempts", [])
     execution_rows = "".join(
         f"<tr><td>{_escape(item.get('attempt'))}</td>"
@@ -277,6 +435,7 @@ def _render_html(
                    if test_waiver else "按当前事实审核状态生成；具体审核记录见审计轨迹。")
     scope = {"consolidated": "合并口径", "parent": "母公司口径"}.get(filing.scope, filing.scope)
     generated = datetime.now(UTC).isoformat()
+    workflow_html = _render_workflow_html(output.agent_workflow)
     return f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><title>FinReport 财报分析报告</title>
 <style>{CSS}</style></head><body>
@@ -291,6 +450,7 @@ def _render_html(
 <h2>结构化指标</h2><p class="meta">金额指标已按原文单位倍率换算为元；比率 1 对应 100%。不可用指标保留原因。</p>
 <table><tr><th>指标</th><th>值</th><th>单位</th><th>状态</th><th>公式版本</th></tr>{metric_rows}</table>
 <h2>已核验指标观察与依据</h2>{claim_rows}
+{workflow_html}
 <h2>异常观察</h2><ul>{anomaly_rows}</ul>
 <h2>证据索引</h2><ul class="evidence">{evidence_rows}</ul>
 <h2>模型定性观点：待人工复核</h2>
@@ -303,11 +463,12 @@ def _render_html(
 <p>候选摘录：{_escape(context.get('candidate_excerpt_count', 0))}；因预算省略：{_escape(context.get('omitted_excerpt_count', 0))}；不完整问项：{_escape(context.get('incomplete_question_count', 0))}。不完整问项禁止支撑独立定性断言；跨页问项仍需人工核对。</p>
 <p class="meta">省略原因：{_escape(context.get('omission_reasons', {}))}</p>
 <table><tr><th>调用</th><th>供应商响应ID</th><th>校验结果</th><th>耗时秒</th><th>总tokens</th><th>思考字段</th></tr>{execution_rows}</table>
+{reasoning_html}
 <p class="meta">供应商暴露的思考文本不等于完整内部推理，也不证明财务结论正确。原始请求、响应、失败校验和渲染前后对照保存在复现包中。</p>
 <p>离线复现包接口：/api/v1/analyses/{analysis.id}/reproduction。离线重放校验原有输入输出；再次联网调用模型不保证逐字相同。哈希不能防止数据库管理员同时改写数据与哈希。</p>
 <h3>模型引用的{context_label}</h3><ul class="evidence">{context_rows}</ul>
 <h2>分析边界与限制</h2><ul class="limitations">{limitations}</ul>
-<footer>仅供研究与教学，不构成投资建议。导出使用已完成且未失效的分析，并与当前输入快照核对一致。</footer>
+<footer>仅供研究与教学，不构成投资建议。分析状态：{_escape(analysis.status)}；导出与当前输入快照核对一致，未完成事项保留在材料清单中。</footer>
 </body></html>"""
 
 

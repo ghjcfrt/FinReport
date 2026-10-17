@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.metadata
+import json
 import platform
 import subprocess
 from datetime import UTC, date, datetime
@@ -14,12 +15,16 @@ from finance_adapters.persistence.models import AnalysisRun
 BUNDLE_VERSION = "finreport-reproduction-v1"
 SOURCE_FILES = (
     "packages/finance-adapters/src/finance_adapters/providers/llm_analysis.py",
+    "packages/finance-adapters/src/finance_adapters/providers/analysis_agent.py",
+    "packages/finance-adapters/src/finance_adapters/providers/evidence_retrieval.py",
+    "packages/finance-adapters/src/finance_adapters/providers/evidence_completeness.py",
     "packages/finance-adapters/src/finance_adapters/providers/model_clients.py",
     "packages/finance-adapters/src/finance_adapters/providers/document_context.py",
     "packages/finance-adapters/src/finance_adapters/providers/reproduction.py",
     "packages/finance-adapters/src/finance_adapters/persistence/metric_gateway.py",
     "packages/finance-adapters/src/finance_adapters/persistence/audit.py",
     "packages/finance-domain/src/finance_domain/analysis/contracts.py",
+    "packages/finance-domain/src/finance_domain/analysis/agent.py",
     "packages/finance-domain/src/finance_domain/metrics/definitions.py",
     "packages/finance-domain/src/finance_domain/metrics/formulas.py",
     "packages/finance-domain/src/finance_domain/filings/concepts.py",
@@ -27,7 +32,9 @@ SOURCE_FILES = (
     "packages/finance-domain/src/finance_domain/filings/disclosures.py",
     "packages/finance-adapters/src/finance_adapters/parsing/annual_disclosures.py",
     "packages/finance-adapters/src/finance_adapters/persistence/disclosure_gateway.py",
+    "packages/finance-adapters/src/finance_adapters/persistence/comparative_gateway.py",
     "packages/finance-adapters/src/finance_adapters/exports/report_renderer.py",
+    "packages/finance-adapters/src/finance_adapters/exports/reasoning.py",
     "packages/finance-adapters/src/finance_adapters/persistence/mapping_gateway.py",
     "packages/finance-adapters/src/finance_adapters/persistence/review_gateway.py",
     "packages/finance-adapters/src/finance_adapters/parsing/pdf_parser.py",
@@ -92,7 +99,8 @@ def runtime_manifest() -> dict:
 
 
 def build_reproduction_bundle(run: AnalysisRun) -> dict:
-    if run.status not in {"completed", "failed"} or run.status == "completed" and run.invalidated_at is not None:
+    report_states = {"completed", "partial_result", "waiting_for_documents"}
+    if run.status not in report_states | {"failed"} or run.status in report_states and run.invalidated_at is not None:
         raise ValueError("REPRODUCTION_CURRENT_TERMINAL_ANALYSIS_REQUIRED")
     trace = run.tool_trace or {}
     if not trace.get("evidence_package") or not trace.get("attempts"):
@@ -263,6 +271,116 @@ def _validate_raw(raw_content: str, package: dict) -> tuple[dict | None, dict, s
     return output.model_dump(mode="json") if output is not None else None, stages, error, issues
 
 
+def _check_stream_evidence(attempt: dict) -> dict:
+    """Rebuild saved SSE without network access and compare it with normalization.
+
+    The event log proves how saved chunks map to the saved response. It does not
+    independently attest a network timeout; that transport claim is checked for
+    consistency with a partial stream and the recorded transport exception.
+    """
+    import httpx
+
+    from finance_adapters.providers.model_clients import ModelClient, ModelConfig, ModelRequestError
+
+    metadata = attempt["provider_metadata"]
+    body = metadata.get("request", {}).get("body", {})
+    events = metadata.get("stream_events")
+    if not isinstance(events, list) or metadata.get("stream_events_sha256") != stable_hash(events):
+        raise ValueError("REPLAY_PROVIDER_STREAM_EVENTS_HASH_MISMATCH")
+    if body.get("stream") is not True or metadata.get("stream_transport") != "sse":
+        raise ValueError("REPLAY_PROVIDER_STREAM_REQUEST_MISMATCH")
+    if metadata.get("provider") == "anthropic":
+        raise ValueError("REPLAY_PROVIDER_STREAM_REQUEST_MISMATCH")
+    if type(metadata.get("status_code")) is not int or not 200 <= metadata["status_code"] < 300:
+        raise ValueError("REPLAY_PROVIDER_STREAM_STATUS_MISMATCH")
+    wire: list[str] = []
+    for event in events:
+        if not isinstance(event, dict):
+            raise TypeError("REPLAY_PROVIDER_STREAM_EVENT_INVALID")
+        if set(event) == {"comment"}:
+            comment = event["comment"]
+            if not isinstance(comment, str) or "\n" in comment or "\r" in comment:
+                raise ValueError("REPLAY_PROVIDER_STREAM_EVENT_INVALID")
+            wire.append(":" + comment + "\n\n")
+            continue
+        if set(event) not in ({"event", "id", "data"}, {"event", "id", "data", "data_encoding"}):
+            raise ValueError("REPLAY_PROVIDER_STREAM_EVENT_INVALID")
+        name, event_id = event["event"], event["id"]
+        if (not isinstance(name, str) or "\n" in name or "\r" in name
+                or event_id is not None and (not isinstance(event_id, str) or "\n" in event_id or "\r" in event_id)):
+            raise ValueError("REPLAY_PROVIDER_STREAM_EVENT_INVALID")
+        encoding = event.get("data_encoding")
+        payload = event["data"]
+        if encoding == "sentinel" or encoding is None and payload == "[DONE]":
+            if payload != "[DONE]":
+                raise ValueError("REPLAY_PROVIDER_STREAM_EVENT_INVALID")
+            raw = "[DONE]"
+        elif encoding == "raw":
+            if not isinstance(payload, str):
+                raise ValueError("REPLAY_PROVIDER_STREAM_EVENT_INVALID")
+            raw = payload
+        elif encoding in {None, "json"}:
+            # Pre-encoding event logs used dicts for valid JSON and strings for
+            # malformed JSON. New logs disambiguate valid JSON string scalars.
+            raw = payload if encoding is None and isinstance(payload, str) else json.dumps(
+                payload, ensure_ascii=False, sort_keys=True)
+        else:
+            raise ValueError("REPLAY_PROVIDER_STREAM_EVENT_INVALID")
+        wire.append("event: " + name + "\n")
+        if event_id is not None:
+            wire.append("id: " + event_id + "\n")
+        wire.extend("data: " + line + "\n" for line in raw.split("\n"))
+        wire.append("\n")
+    client = ModelClient(ModelConfig(metadata.get("provider", "openai"), "", "", metadata.get("model", "")))
+    replayed: dict = {}
+    replay_error = None
+    try:
+        client._stream_data(httpx.Response(200, text="".join(wire)), replayed)
+    except ModelRequestError as exc:
+        replay_error = str(exc)
+    aggregation_error = replay_error
+    if replay_error is None:
+        try:
+            client._response(replayed["response"], native_action_schema=attempt["request"].get("native_action_schema"))
+        except ModelRequestError as exc:
+            replay_error = str(exc)
+    if metadata.get("response") != replayed.get("response"):
+        raise ValueError("REPLAY_PROVIDER_STREAM_RESPONSE_MISMATCH")
+    error = metadata.get("error", {})
+    code = error.get("code")
+    interrupted = attempt.get("status") == "provider_failed" and code in {
+        "MODEL_REQUEST_TIMEOUT", "MODEL_REQUEST_FAILED",
+    }
+    for field in ("stream_done", "usage", "reasoning_output", "finish_reason"):
+        if type(metadata.get(field)) is not type(replayed.get(field)) or metadata.get(field) != replayed.get(field):
+            raise ValueError("REPLAY_PROVIDER_STREAM_NORMALIZATION_MISMATCH")
+    if type(metadata.get("stream_complete")) is not bool:
+        raise ValueError("REPLAY_PROVIDER_STREAM_NORMALIZATION_MISMATCH")
+    if not interrupted and metadata["stream_complete"] != replayed.get("stream_complete"):
+        raise ValueError("REPLAY_PROVIDER_STREAM_NORMALIZATION_MISMATCH")
+    failed = attempt.get("status") == "provider_failed"
+    if failed and code in {"MODEL_REQUEST_TIMEOUT", "MODEL_REQUEST_FAILED"}:
+        allowed_types = ({"TimeoutException", "ReadTimeout", "WriteTimeout", "ConnectTimeout", "PoolTimeout"}
+                         if code == "MODEL_REQUEST_TIMEOUT" else {"ReadError", "RemoteProtocolError",
+                             "NetworkError", "ProtocolError", "ConnectError", "WriteError", "CloseError"})
+        if (metadata.get("stream_complete") is not False or error.get("type") not in allowed_types
+                or aggregation_error not in {None, "MODEL_STREAM_INCOMPLETE"}):
+            raise ValueError("REPLAY_PROVIDER_STREAM_FAILURE_CLASSIFICATION_MISMATCH")
+        # A timeout may happen after a finish chunk while waiting for the socket
+        # to close. In that case the recorded transport is still a failure, but
+        # replaying the saved complete events reaches a finish normally.
+    elif replay_error:
+        if not failed or error != {"type": "ModelRequestError", "code": replay_error}:
+            raise ValueError("REPLAY_PROVIDER_STREAM_FAILURE_CLASSIFICATION_MISMATCH")
+    elif metadata.get("stream_complete") is not True:
+        raise ValueError("REPLAY_PROVIDER_STREAM_NORMALIZATION_MISMATCH")
+    return {"events_hash_matches": True, "response_matches_events": True,
+            "complete": metadata["stream_complete"], "done_received": metadata["stream_done"],
+            "replayed_error": replay_error,
+            "failure_classification_verified": failed and (replay_error is not None or code in {
+                "MODEL_REQUEST_TIMEOUT", "MODEL_REQUEST_FAILED"})}
+
+
 def _check_provider_metadata(attempt: dict) -> dict:
     from finance_adapters.providers.model_clients import ModelClient, ModelConfig, ModelRequestError
 
@@ -280,6 +398,9 @@ def _check_provider_metadata(attempt: dict) -> dict:
         raise ValueError("REPLAY_PROVIDER_RESPONSE_HASH_MISMATCH")
     if response is None and metadata.get("response_sha256") is not None:
         raise ValueError("REPLAY_PROVIDER_RESPONSE_HASH_MISMATCH")
+    stream = _check_stream_evidence(attempt) if "stream_events" in metadata else None
+    if stream is None and metadata.get("stream_transport") == "sse":
+        raise ValueError("REPLAY_PROVIDER_STREAM_EVENTS_REQUIRED")
     if isinstance(response, dict):
         client = ModelClient(ModelConfig(metadata.get("provider", "openai"), "", "", metadata.get("model", "")))
         try:
@@ -292,22 +413,32 @@ def _check_provider_metadata(attempt: dict) -> dict:
         if metadata.get("reasoning_output", []) != actual_reasoning:
             raise ValueError("REPLAY_PROVIDER_REASONING_METADATA_MISMATCH")
     body, model_request = request.get("body", {}), attempt["request"]
+    native_schema = model_request.get("native_action_schema")
     if request.get("method") != "POST":
         raise ValueError("REPLAY_PROVIDER_REQUEST_METHOD_MISMATCH")
     if metadata.get("provider") == "anthropic":
         same_input = body.get("system") == model_request["system"] and body.get("messages") == [
             {"role": "user", "content": model_request["user"]}]
+        if native_schema is not None and (body.get("tools") != [ModelClient._action_tool(native_schema, anthropic=True)]
+                or body.get("tool_choice") != {"type": "tool", "name": ModelClient.ACTION_TOOL_NAME,
+                                               "disable_parallel_tool_use": True}):
+            raise ValueError("REPLAY_PROVIDER_ACTION_TOOL_MISMATCH")
     else:
         same_input = body.get("messages") == [
             {"role": "system", "content": model_request["system"]},
             {"role": "user", "content": model_request["user"]}]
-        expected_format = {"type": "json_object"}
+        expected_format = {"type": "json_object"} if model_request.get("response_json", True) else None
         if "response_schema" in model_request:
             expected_format = {"type": "json_schema", "json_schema": {
                 "name": "finreport_analysis", "strict": True,
                 "schema": ModelClient._strict_schema(model_request["response_schema"]),
             }}
-        if body.get("response_format") != expected_format:
+        if native_schema is not None:
+            if (body.get("tools") != [ModelClient._action_tool(native_schema)]
+                    or body.get("tool_choice") != {"type": "function", "function": {"name": ModelClient.ACTION_TOOL_NAME}}
+                    or body.get("parallel_tool_calls") is not False or "response_format" in body):
+                raise ValueError("REPLAY_PROVIDER_ACTION_TOOL_MISMATCH")
+        elif body.get("response_format") != expected_format:
             raise ValueError("REPLAY_PROVIDER_RESPONSE_FORMAT_MISMATCH")
     if not same_input:
         raise ValueError("REPLAY_PROVIDER_INPUT_MISMATCH")
@@ -325,6 +456,15 @@ def _check_provider_metadata(attempt: dict) -> dict:
             choices = response.get("choices", [])
             text = choices[0].get("message", {}).get("content") if choices else None
             finish = choices[0].get("finish_reason") if choices else None
+        if native_schema is not None:
+            try:
+                text, normalized = client._response(response, native_action_schema=native_schema)
+            except (ModelRequestError, TypeError, ValueError) as exc:
+                raise ValueError("REPLAY_PROVIDER_ACTION_RESPONSE_INVALID") from exc
+            if any(metadata.get(key) != normalized.get(key) for key in (
+                "response_channel", "action_tool_name", "action_tool_id",
+            )):
+                raise ValueError("REPLAY_PROVIDER_ACTION_NORMALIZATION_MISMATCH")
         if text != attempt["raw_content"]:
             raise ValueError("REPLAY_PROVIDER_RAW_CONTENT_MISMATCH")
         if metadata.get("usage") != response.get("usage") or metadata.get("finish_reason") != finish:
@@ -335,15 +475,17 @@ def _check_provider_metadata(attempt: dict) -> dict:
             raise ValueError("REPLAY_PROVIDER_FAILURE_ERROR_MISMATCH")
         code = error["code"]
         if code == "MODEL_REQUEST_TIMEOUT":
-            valid_failure = (response is None and status_code is None
+            valid_failure = (stream is not None and stream["failure_classification_verified"] or
+                             response is None and status_code is None
                              and error.get("type") in {"TimeoutException", "ReadTimeout", "WriteTimeout", "ConnectTimeout", "PoolTimeout"})
         elif code == "MODEL_REQUEST_FAILED":
-            valid_failure = (error.get("type") == "HTTPStatusError"
+            valid_failure = (stream is not None and stream["failure_classification_verified"] or
+                             error.get("type") == "HTTPStatusError"
                              and isinstance(status_code, int) and not 200 <= status_code < 400
                              or response is None and status_code is None and error.get("type") not in {None, "HTTPStatusError"})
             if not valid_failure and isinstance(response, dict) and isinstance(status_code, int) and 200 <= status_code < 300:
                 try:
-                    client._response(response)
+                    client._response(response, native_action_schema=native_schema)
                 except ModelRequestError:
                     pass
                 except Exception as exc:  # noqa: BLE001 - the original adapter also classified unexpected parsing errors.
@@ -353,17 +495,20 @@ def _check_provider_metadata(attempt: dict) -> dict:
         elif code == "MODEL_INVALID_RESPONSE":
             valid_failure = response is not None and not isinstance(response, dict)
         else:
-            valid_failure = False
-            if isinstance(response, dict) and isinstance(status_code, int) and 200 <= status_code < 300:
+            valid_failure = stream is not None and stream["failure_classification_verified"]
+            if not valid_failure and isinstance(response, dict) and isinstance(status_code, int) and 200 <= status_code < 300:
                 try:
-                    client._response(response)
+                    client._response(response, native_action_schema=native_schema)
                 except ModelRequestError as exc:
                     valid_failure = str(exc) == code
         if not valid_failure:
             raise ValueError("REPLAY_PROVIDER_FAILURE_RESPONSE_CLASSIFICATION_MISMATCH")
-    return {"available": True, "request_hash_matches": True,
+    result = {"available": True, "request_hash_matches": True,
             "response_hash_matches": response is not None,
             "supplier_reasoning_fields": [item.get("field") for item in metadata.get("reasoning_output", [])]}
+    if stream is not None:
+        result["stream"] = stream
+    return result
 
 
 def _replay_attempts(trace: dict, package: dict) -> tuple[list[dict], dict | None]:
@@ -371,6 +516,7 @@ def _replay_attempts(trace: dict, package: dict) -> tuple[list[dict], dict | Non
 
     from finance_domain.analysis.contracts import AnalysisOutput
 
+    from finance_adapters.providers.analysis_agent import replay_evidence_workflow
     from finance_adapters.providers.llm_analysis import (
         SYSTEM_PROMPT,
         _analysis_request,
@@ -379,7 +525,9 @@ def _replay_attempts(trace: dict, package: dict) -> tuple[list[dict], dict | Non
         validate_analysis_output,
     )
 
-    expected_request, results, accepted_output = _analysis_request(package), [], None
+    replay_evidence_workflow(trace, package, _check_provider_metadata)
+    workflow = trace.get("agent_workflow")
+    expected_request, results, accepted_output = _analysis_request(package, workflow), [], None
     attempts = trace["attempts"]
     if not 1 <= len(attempts) <= 2 or trace.get("system_prompt") != SYSTEM_PROMPT:
         raise ValueError("REPLAY_ATTEMPT_SEQUENCE_OR_SYSTEM_PROMPT_MISMATCH")
@@ -424,7 +572,7 @@ def _replay_attempts(trace: dict, package: dict) -> tuple[list[dict], dict | Non
         else:
             if status not in {"accepted", "render_rejected"} or index != len(attempts) - 1:
                 raise ValueError("REPLAY_ACCEPTANCE_CLASSIFICATION_MISMATCH")
-            rendered = finalize_analysis_output(AnalysisOutput.model_validate(model_output), package).model_dump(mode="json")
+            rendered = finalize_analysis_output(AnalysisOutput.model_validate(model_output), package, workflow).model_dump(mode="json")
             if attempt.get("rendered_output") != rendered:
                 raise ValueError("REPLAY_RENDERED_OUTPUT_MISMATCH")
             transition = attempt.get("provider_to_render", {})
@@ -458,7 +606,7 @@ def validate_saved_analysis_run(run: AnalysisRun, package: dict) -> None:
         VALIDATOR_VERSION,
     )
 
-    if run.status != "completed" or run.failure_reason is not None:
+    if run.status not in {"completed", "partial_result", "waiting_for_documents"} or run.failure_reason is not None:
         raise ValueError("REPLAY_COMPLETED_ANALYSIS_STATE_MISMATCH")
     versions = (PROMPT_VERSION, VALIDATOR_VERSION, ORCHESTRATION_VERSION)
     if (run.prompt_version, run.validator_version, run.orchestration_version) != versions:
@@ -480,6 +628,9 @@ def validate_saved_analysis_run(run: AnalysisRun, package: dict) -> None:
         raise ValueError("REPLAY_PROVIDER_TRANSPORT_EVIDENCE_REQUIRED")
     if rendered is None or rendered != run.output or trace.get("output_hash") != stable_hash(rendered):
         raise ValueError("REPLAY_RENDERED_OUTPUT_MISMATCH")
+    workflow = trace.get("agent_workflow")
+    if workflow is not None and workflow.get("status") != run.status:
+        raise ValueError("REPLAY_WORKFLOW_STATUS_MISMATCH")
 
 
 def replay_bundle(bundle: dict, source_pdf: Path | None = None) -> dict:
@@ -512,7 +663,7 @@ def replay_bundle(bundle: dict, source_pdf: Path | None = None) -> dict:
     reference_results = _reference_results(package)
     attempt_results, replayed = _replay_attempts(trace, package)
     analysis_status = payload.get("analysis_status", "completed")
-    if analysis_status == "completed":
+    if analysis_status in {"completed", "partial_result", "waiting_for_documents"}:
         if payload.get("failure_reason") is not None or trace.get("failure_reason") is not None:
             raise ValueError("REPLAY_COMPLETED_ANALYSIS_STATE_MISMATCH")
         if replayed is None:
@@ -520,6 +671,9 @@ def replay_bundle(bundle: dict, source_pdf: Path | None = None) -> dict:
         if replayed != payload["output"] or trace.get("output_hash") != stable_hash(replayed):
             raise ValueError("REPLAY_RENDERED_OUTPUT_MISMATCH")
         validate_analysis_output(payload["output"], package)
+        workflow = trace.get("agent_workflow")
+        if workflow is not None and workflow.get("status") != analysis_status:
+            raise ValueError("REPLAY_WORKFLOW_STATUS_MISMATCH")
     elif analysis_status == "failed":
         if payload["output"] is not None or not payload.get("failure_reason") or payload["failure_reason"] != trace.get("failure_reason"):
             raise ValueError("REPLAY_FAILED_ANALYSIS_STATE_MISMATCH")
@@ -548,7 +702,7 @@ def replay_bundle(bundle: dict, source_pdf: Path | None = None) -> dict:
         "reference_metrics": reference_results, "reference_metric_count": len(reference_results),
         "all_supported_metrics_present": {item["code"] for item in reference_results} == set(REFERENCE_FORMULAS),
         "supported_metric_count": len(REFERENCE_FORMULAS),
-        "attempts": attempt_results, "rendered_output_matches": True if analysis_status == "completed" else None,
+        "attempts": attempt_results, "rendered_output_matches": True if analysis_status in {"completed", "partial_result", "waiting_for_documents"} else None,
         "source_code_matches": code_match, "source_pdf_matches": pdf_verified,
         "runtime_provenance": {
             "execution_runtime_recorded": execution_runtime is not None,

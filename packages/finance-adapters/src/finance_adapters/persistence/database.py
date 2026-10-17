@@ -28,6 +28,7 @@ def init_database() -> None:
             "retry_count": "INTEGER DEFAULT 0", "queued_at": "DATETIME",
             "owner_token": "VARCHAR(64)", "lease_expires_at": "DATETIME",
             "extraction_method": "VARCHAR(16) DEFAULT 'pdf_text'",
+            "page_numbers": "JSON",
         },
         "ocr_calls": {"response_text": "TEXT", "started_at": "DATETIME"},
         "table_candidates": {"ocr_call_id": "INTEGER REFERENCES ocr_calls(id)"},
@@ -47,6 +48,12 @@ def init_database() -> None:
         "validation_results": {"tolerance": "VARCHAR(128)"},
         "analysis_claims": {"review_status": "VARCHAR(32) DEFAULT 'not_required'"},
         "file_scans": {"original_filename": "VARCHAR(255)"},
+        "document_text_chunks": {
+            "page_sha256": "VARCHAR(64) DEFAULT ''",
+            "review_status": "VARCHAR(32) DEFAULT 'unreviewed'",
+            "review_digest": "VARCHAR(64)", "reviewer_id": "VARCHAR(128)",
+            "reviewed_at": "DATETIME",
+        },
     }
     inspector = inspect(engine)
     with engine.begin() as connection:
@@ -55,7 +62,8 @@ def init_database() -> None:
             for name, definition in columns.items():
                 if name not in existing:
                     connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {definition}"))
-    for model in (models.FactDimension, models.EvidenceFragment, models.TableCandidateRecord):
+    for model in (models.FactDimension, models.EvidenceFragment, models.DocumentTextChunk,
+                  models.TableCandidateRecord):
         for index in model.__table__.indexes:
             index.create(engine, checkfirst=True)
 

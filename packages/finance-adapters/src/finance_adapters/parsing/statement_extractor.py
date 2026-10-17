@@ -616,13 +616,50 @@ class _HtmlTables(HTMLParser):
         self.table: list[list[str]] | None = None
         self.row: list[str] | None = None
         self.cell: list[str] | None = None
+        self._table_stack: list[tuple[list, list | None, list | None]] = []
+
+    def _finish_cell(self):
+        if self.cell is not None and self.row is not None:
+            self.row.append("".join(self.cell).strip())
+        self.cell = None
+
+    def _finish_row(self):
+        self._finish_cell()
+        if self.row is not None and self.table is not None:
+            self.table.append(self.row)
+        self.row = None
+
+    def _finish_table(self):
+        self._finish_row()
+        if self.table is not None:
+            self.tables.append(self.table)
+        self.table = None
+
+    def close(self):
+        super().close()
+        self._finish_table()
+        while self._table_stack:
+            self.table, self.row, self.cell = self._table_stack.pop()
+            self._finish_table()
 
     def handle_starttag(self, tag, attrs):
         if tag == "table":
+            if self.table is not None:
+                if self.cell is not None:
+                    # Nested tables are separate candidates; their cells must
+                    # never overwrite or be merged into the outer row.
+                    self._table_stack.append((self.table, self.row, self.cell))
+                else:
+                    self._finish_table()
             self.table = []
+            self.row = self.cell = None
         elif tag == "tr" and self.table is not None:
+            self._finish_row()
             self.row = []
         elif tag in {"td", "th"} and self.row is not None:
+            # HTML permits omitted cell and row end tags. Flush the pending
+            # cell before a sibling starts, preserving empty cells as well.
+            self._finish_cell()
             self.cell = []
         elif tag == "br" and self.cell is not None:
             self.cell.append(" ")
@@ -632,20 +669,20 @@ class _HtmlTables(HTMLParser):
             self.cell.append(data)
 
     def handle_endtag(self, tag):
-        if tag in {"td", "th"} and self.cell is not None and self.row is not None:
-            self.row.append("".join(self.cell).strip())
-            self.cell = None
-        elif tag == "tr" and self.row is not None and self.table is not None:
-            self.table.append(self.row)
-            self.row = None
+        if tag in {"td", "th"}:
+            self._finish_cell()
+        elif tag in {"tr", "thead", "tbody", "tfoot"}:
+            self._finish_row()
         elif tag == "table" and self.table is not None:
-            self.tables.append(self.table)
-            self.table = None
+            self._finish_table()
+            if self._table_stack:
+                self.table, self.row, self.cell = self._table_stack.pop()
 
 
 def ocr_table_candidates(text: str) -> list[list[list[str]]]:
     parser = _HtmlTables()
     parser.feed(text)
+    parser.close()
     if parser.tables:
         return parser.tables
     rows = []

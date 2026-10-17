@@ -1,0 +1,2 @@
+$body = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"FinReport-health","version":"1"}}}'
+try { $r = Invoke-WebRequest 'http://127.0.0.1:18769/mcp' -UseBasicParsing -Method Post -ContentType 'application/json' -Headers @{Accept='application/json, text/event-stream'} -Body $body -TimeoutSec 5; Write-Output "docling http=$($r.StatusCode)" } catch { Write-Error $_; exit 1 }

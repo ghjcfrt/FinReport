@@ -78,6 +78,9 @@ class ExtractionJob(Base):
     progress: Mapped[int] = mapped_column(Integer, default=0)
     parser_version: Mapped[str] = mapped_column(String(64), default="pymupdf-text-v1")
     extraction_method: Mapped[str] = mapped_column(String(16), default="pdf_text")
+    # None means the whole immutable source; otherwise these are original PDF
+    # page numbers, never the renumbered positions of a temporary subset.
+    page_numbers: Mapped[list | None] = mapped_column(JSON, nullable=True)
     error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
     error_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     retryable: Mapped[bool] = mapped_column(default=False)
@@ -207,6 +210,37 @@ class EvidenceFragment(Base):
     page_sha256: Mapped[str] = mapped_column(String(64))
     confidence: Mapped[Decimal] = mapped_column(Numeric(5, 4))
     extractor: Mapped[str] = mapped_column(String(128), default="pymupdf-text-v1")
+
+
+class DocumentTextChunk(Base):
+    """Searchable text kept separate from admitted financial facts.
+
+    A chunk may contain numbers or accounting-policy language, but it never
+    becomes a strict fact merely because it was indexed.  The source hashes
+    and page coordinates make every retrieval result traceable to the selected
+    extraction attempt.
+    """
+
+    __tablename__ = "document_text_chunks"
+    __table_args__ = (UniqueConstraint("filing_version_id", "chunk_key"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    filing_version_id: Mapped[int] = mapped_column(ForeignKey("filing_versions.id"), index=True)
+    chunk_key: Mapped[str] = mapped_column(String(160))
+    page_no: Mapped[int] = mapped_column(Integer, index=True)
+    page_sha256: Mapped[str] = mapped_column(String(64), default="")
+    section: Mapped[str] = mapped_column(String(256), default="page")
+    text: Mapped[str] = mapped_column(Text)
+    text_sha256: Mapped[str] = mapped_column(String(64), index=True)
+    source_sha256: Mapped[str] = mapped_column(String(64), index=True)
+    extraction_method: Mapped[str] = mapped_column(String(16), default="pdf_text")
+    extractor_version: Mapped[str] = mapped_column(String(128), default="unknown")
+    bounding_box: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    related_fact_ids: Mapped[list] = mapped_column(JSON, default=list)
+    review_status: Mapped[str] = mapped_column(String(32), default="unreviewed")
+    review_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    reviewer_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class TableCandidateRecord(Base):

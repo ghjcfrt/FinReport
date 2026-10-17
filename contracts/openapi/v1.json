@@ -453,6 +453,538 @@
         }
       }
     },
+    "/api/v1/analyses/{analysis_run_id}/resume": {
+      "post": {
+        "summary": "Resume Analysis",
+        "description": "Keep the checkpoint and admit newly supplied documents on the next round.",
+        "operationId": "resume_analysis_api_v1_analyses__analysis_run_id__resume_post",
+        "parameters": [
+          {
+            "name": "analysis_run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Analysis Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/filings/{filing_version_id}/text-evidence/index": {
+      "post": {
+        "summary": "Index Text Evidence",
+        "operationId": "index_text_evidence_api_v1_filings__filing_version_id__text_evidence_index_post",
+        "parameters": [
+          {
+            "name": "filing_version_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Filing Version Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/filings/{filing_version_id}/text-evidence": {
+      "get": {
+        "summary": "Get Text Evidence",
+        "operationId": "get_text_evidence_api_v1_filings__filing_version_id__text_evidence_get",
+        "parameters": [
+          {
+            "name": "filing_version_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Filing Version Id"
+            }
+          },
+          {
+            "name": "page_no",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Page No"
+            }
+          },
+          {
+            "name": "query",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 2000
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Query"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 50,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/filings/{filing_version_id}/text-evidence/{chunk_id}/review": {
+      "patch": {
+        "summary": "Review Text Evidence",
+        "operationId": "review_text_evidence_api_v1_filings__filing_version_id__text_evidence__chunk_id__review_patch",
+        "parameters": [
+          {
+            "name": "filing_version_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Filing Version Id"
+            }
+          },
+          {
+            "name": "chunk_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Chunk Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TextReviewRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/filings/{filing_version_id}/text-evidence/review": {
+      "get": {
+        "summary": "Get Text Evidence For Review",
+        "description": "Keep rejected text visible for human correction and re-review.",
+        "operationId": "get_text_evidence_for_review_api_v1_filings__filing_version_id__text_evidence_review_get",
+        "parameters": [
+          {
+            "name": "filing_version_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Filing Version Id"
+            }
+          },
+          {
+            "name": "page_no",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Page No"
+            }
+          },
+          {
+            "name": "review_status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "pattern": "^(unreviewed|confirmed|rejected)$"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Review Status"
+            }
+          },
+          {
+            "name": "include_rejected",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": true,
+              "title": "Include Rejected"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 50,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/filings/{filing_version_id}/report-data": {
+      "get": {
+        "summary": "Get Report Data",
+        "operationId": "get_report_data_api_v1_filings__filing_version_id__report_data_get",
+        "parameters": [
+          {
+            "name": "filing_version_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Filing Version Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/filings/{filing_version_id}/report-data/{candidate_id}/review": {
+      "patch": {
+        "summary": "Review Report Data",
+        "operationId": "review_report_data_api_v1_filings__filing_version_id__report_data__candidate_id__review_patch",
+        "parameters": [
+          {
+            "name": "filing_version_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Filing Version Id"
+            }
+          },
+          {
+            "name": "candidate_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Candidate Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReportMeasureReviewRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/filings/{filing_version_id}/report-analyses": {
+      "post": {
+        "summary": "Start Report Analysis",
+        "operationId": "start_report_analysis_api_v1_filings__filing_version_id__report_analyses_post",
+        "parameters": [
+          {
+            "name": "filing_version_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Filing Version Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ReportAnalysisRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Payload"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/report-analyses/{analysis_run_id}": {
+      "get": {
+        "summary": "Get Report Analysis",
+        "operationId": "get_report_analysis_api_v1_report_analyses__analysis_run_id__get",
+        "parameters": [
+          {
+            "name": "analysis_run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Analysis Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReportAnalysisEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/report-analyses/{analysis_run_id}/replay": {
+      "get": {
+        "summary": "Replay Report Analysis Route",
+        "operationId": "replay_report_analysis_route_api_v1_report_analyses__analysis_run_id__replay_get",
+        "parameters": [
+          {
+            "name": "analysis_run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Analysis Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/health": {
       "get": {
         "summary": "Health",
@@ -1238,7 +1770,9 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/AnalysisReasoningEnvelope"
+                }
               }
             }
           },
@@ -1491,6 +2025,161 @@
   },
   "components": {
     "schemas": {
+      "AnalysisReasoningEnvelope": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/AnalysisReasoningView"
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "data_as_of": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Data As Of"
+          },
+          "cache_generated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Cache Generated At"
+          },
+          "rule_version": {
+            "type": "string",
+            "title": "Rule Version"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data",
+          "request_id",
+          "data_as_of",
+          "cache_generated_at",
+          "rule_version"
+        ],
+        "title": "AnalysisReasoningEnvelope"
+      },
+      "AnalysisReasoningView": {
+        "properties": {
+          "analysis_run_id": {
+            "type": "integer",
+            "title": "Analysis Run Id"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "output": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output"
+          },
+          "failure_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure Reason"
+          },
+          "input_snapshot_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Input Snapshot Hash"
+          },
+          "tool_trace_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool Trace Hash"
+          },
+          "validator_version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Validator Version"
+          },
+          "orchestration_version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Orchestration Version"
+          },
+          "tool_trace": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool Trace"
+          },
+          "invalidated_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Invalidated At"
+          },
+          "provider_reasoning": {
+            "$ref": "#/components/schemas/ProviderReasoningView"
+          }
+        },
+        "type": "object",
+        "required": [
+          "analysis_run_id",
+          "status",
+          "output",
+          "failure_reason",
+          "input_snapshot_hash",
+          "tool_trace_hash",
+          "validator_version",
+          "orchestration_version",
+          "tool_trace",
+          "invalidated_at",
+          "provider_reasoning"
+        ],
+        "title": "AnalysisReasoningView"
+      },
       "Body_upload_filing_api_v1_filings_post": {
         "properties": {
           "file": {
@@ -1648,6 +2337,23 @@
             ],
             "title": "Extraction Method",
             "default": "pdf_text"
+          },
+          "page_numbers": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer",
+                  "exclusiveMinimum": 0.0
+                },
+                "type": "array",
+                "maxItems": 5000,
+                "minItems": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Page Numbers"
           }
         },
         "additionalProperties": false,
@@ -1684,7 +2390,8 @@
             "type": "string",
             "enum": [
               "openai",
-              "anthropic"
+              "anthropic",
+              "baidu-unlimited-ocr"
             ],
             "title": "Provider"
           },
@@ -2222,6 +2929,285 @@
         ],
         "title": "OcrMappingCompletionRequest"
       },
+      "ProviderReasoningCall": {
+        "properties": {
+          "stage": {
+            "type": "string",
+            "title": "Stage"
+          },
+          "call_index": {
+            "type": "integer",
+            "title": "Call Index"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "returned",
+              "disabled",
+              "not_returned"
+            ],
+            "title": "Status"
+          },
+          "thinking_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Thinking Enabled"
+          },
+          "fields": {
+            "items": {
+              "$ref": "#/components/schemas/ProviderReasoningField"
+            },
+            "type": "array",
+            "title": "Fields"
+          }
+        },
+        "type": "object",
+        "required": [
+          "stage",
+          "call_index",
+          "status",
+          "thinking_enabled",
+          "fields"
+        ],
+        "title": "ProviderReasoningCall"
+      },
+      "ProviderReasoningField": {
+        "properties": {
+          "field": {
+            "type": "string",
+            "title": "Field"
+          },
+          "content": {
+            "type": "string",
+            "title": "Content"
+          }
+        },
+        "type": "object",
+        "required": [
+          "field",
+          "content"
+        ],
+        "title": "ProviderReasoningField"
+      },
+      "ProviderReasoningView": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "available",
+              "not_returned",
+              "not_called"
+            ],
+            "title": "Status"
+          },
+          "calls": {
+            "items": {
+              "$ref": "#/components/schemas/ProviderReasoningCall"
+            },
+            "type": "array",
+            "title": "Calls"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status",
+          "calls"
+        ],
+        "title": "ProviderReasoningView"
+      },
+      "ReportAnalysisEnvelope": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ReportAnalysisView"
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "data_as_of": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Data As Of"
+          },
+          "cache_generated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Cache Generated At"
+          },
+          "rule_version": {
+            "type": "string",
+            "title": "Rule Version"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data",
+          "request_id",
+          "data_as_of",
+          "cache_generated_at",
+          "rule_version"
+        ],
+        "title": "ReportAnalysisEnvelope"
+      },
+      "ReportAnalysisRequest": {
+        "properties": {
+          "selected_document_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array",
+                "maxItems": 50,
+                "minItems": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selected Document Ids"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "ReportAnalysisRequest"
+      },
+      "ReportAnalysisView": {
+        "properties": {
+          "analysis_run_id": {
+            "type": "integer",
+            "title": "Analysis Run Id"
+          },
+          "filing_version_id": {
+            "type": "integer",
+            "title": "Filing Version Id"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "output": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output"
+          },
+          "failure_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure Reason"
+          },
+          "input_snapshot_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Input Snapshot Hash"
+          },
+          "tool_trace_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool Trace Hash"
+          },
+          "orchestration_version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Orchestration Version"
+          },
+          "invalidated_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Invalidated At"
+          },
+          "provider_reasoning": {
+            "$ref": "#/components/schemas/ProviderReasoningView"
+          }
+        },
+        "type": "object",
+        "required": [
+          "analysis_run_id",
+          "filing_version_id",
+          "status",
+          "output",
+          "failure_reason",
+          "input_snapshot_hash",
+          "tool_trace_hash",
+          "orchestration_version",
+          "invalidated_at",
+          "provider_reasoning"
+        ],
+        "title": "ReportAnalysisView"
+      },
+      "ReportMeasureReviewRequest": {
+        "properties": {
+          "decision": {
+            "type": "string",
+            "pattern": "^(confirmed|rejected)$",
+            "title": "Decision"
+          },
+          "reviewer_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Reviewer Id"
+          },
+          "reason": {
+            "type": "string",
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Reason"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "decision",
+          "reviewer_id",
+          "reason"
+        ],
+        "title": "ReportMeasureReviewRequest"
+      },
       "ReviewRequest": {
         "properties": {
           "reviewer_id": {
@@ -2268,6 +3254,41 @@
           "reason"
         ],
         "title": "ReviewRequest"
+      },
+      "TextReviewRequest": {
+        "properties": {
+          "decision": {
+            "type": "string",
+            "pattern": "^(confirmed|rejected)$",
+            "title": "Decision"
+          },
+          "reviewer_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Reviewer Id"
+          },
+          "reason": {
+            "type": "string",
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Reason"
+          },
+          "expected_text_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Expected Text Sha256"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "decision",
+          "reviewer_id",
+          "reason",
+          "expected_text_sha256"
+        ],
+        "title": "TextReviewRequest"
       },
       "ValidationError": {
         "properties": {

@@ -6,6 +6,8 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 
+from finance_domain.analysis.agent import AgentWorkflowResult
+
 PositiveId = Annotated[int, Field(strict=True, gt=0)]
 NonBlankText = Annotated[str, Field(min_length=1)]
 
@@ -14,6 +16,14 @@ class ExtractionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     extraction_method: Literal["pdf_text", "ocr"] = "pdf_text"
+    page_numbers: list[PositiveId] | None = Field(default=None, min_length=1, max_length=5000)
+
+    @field_validator("page_numbers")
+    @classmethod
+    def unique_pages(cls, value):
+        if value is not None and len(value) != len(set(value)):
+            raise ValueError("DUPLICATE_PAGE_NUMBER")
+        return sorted(value) if value is not None else None
 
 
 ImageCoordinate = Annotated[float, Field(strict=True, allow_inf_nan=False)]
@@ -171,6 +181,9 @@ class AnalysisOutput(BaseModel):
     claims: list[Claim]
     limitations: list[NonBlankText]
     report_sections: list[NonBlankText] = Field(min_length=1)
+    # The orchestrator attaches this after claim validation.  Textual findings
+    # have their own source contract and need not pretend to be metric claims.
+    agent_workflow: AgentWorkflowResult | None = None
 
     @field_validator("overall_review_required", mode="before")
     @classmethod
@@ -196,13 +209,13 @@ class ComparisonRequest(BaseModel):
 
 
 class ModelSettingsUpdate(BaseModel):
-    provider: Literal["openai", "anthropic"]
+    provider: Literal["openai", "anthropic", "baidu-unlimited-ocr"]
     base_url: str = Field(min_length=1, max_length=500)
     api_key: str | None = Field(default=None, max_length=500)
     model: str = Field(min_length=1, max_length=200)
 
 
 class ModelDiscoveryRequest(BaseModel):
-    provider: Literal["openai", "anthropic"]
+    provider: Literal["openai", "anthropic", "baidu-unlimited-ocr"]
     base_url: str = Field(min_length=1, max_length=500)
     api_key: str | None = Field(default=None, max_length=500)

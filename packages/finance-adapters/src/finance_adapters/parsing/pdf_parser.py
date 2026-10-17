@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from finance_adapters.config import settings
 from finance_adapters.parsing.annual_disclosures import document_annual_disclosures
+from finance_adapters.parsing.report_measures import selected_pages, validate_report_period
 from finance_adapters.parsing.statement_extractor import (
     StatementExtractor,
     declared_currency,
@@ -43,7 +44,7 @@ from finance_adapters.storage.object_storage import file_sha256
 
 PARSER_VERSION = "pymupdf-statements-v5"
 TABLE_LAYOUT_VERSION = "pymupdf-statement-layout-v1"
-OCR_PARSER_VERSION = "ocr-table-review-v2"
+OCR_PARSER_VERSION = "ocr-table-review-v3-unlimited-ocr"
 
 # Extraction is deliberately conservative. Unknown labels remain candidates and cannot enter strict calculations.
 CONCEPTS = CONCEPT_LABELS
@@ -160,7 +161,7 @@ def _run_ocr(
         try:
             text, trace = client.vision(
                 system="Return the page faithfully; preserve table cells, headings and units.",
-                prompt="Recognize this financial-report page. Return text and HTML or Markdown tables without inferring values.",
+                prompt=settings.ocr_prompt,
                 image=page_png,
             )
             if not text.strip():
@@ -168,12 +169,31 @@ def _run_ocr(
             call.status, call.response_id = "completed", trace.get("id")
             call.response_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
             call.response_text = text
+            call.error_detail = None
+            record_audit_event(
+                session, filing.id, category="tool", action="ocr_provider_attempt", status="completed",
+                source_ref=f"page:{page_no}", tool_name=settings.ocr_provider,
+                tool_version=OCR_PARSER_VERSION, input_hash=page_hash,
+                output_hash=trace.get("response_sha256"),
+                detail={"ocr_call_id": call.id, "page_no": page_no, "attempt": attempt + 1,
+                        "provider_metadata": trace},
+            )
             break
         except Exception as exc:  # noqa: BLE001 - persist bounded provider retries
             last_error = exc
             call.status = "retrying" if attempt < settings.ocr_max_retries else "failed"
             call.error_detail = str(exc)
             job.retry_count += 1
+            trace = getattr(exc, "metadata", {})
+            record_audit_event(
+                session, filing.id, category="tool", action="ocr_provider_attempt", status="failed",
+                source_ref=f"page:{page_no}", tool_name=settings.ocr_provider,
+                tool_version=OCR_PARSER_VERSION, input_hash=page_hash,
+                output_hash=trace.get("response_sha256"),
+                detail={"ocr_call_id": call.id, "page_no": page_no, "attempt": attempt + 1,
+                        "error_code": str(exc), "provider_metadata": trace},
+            )
+            call.duration_ms = int((time.perf_counter() - started) * 1000)
             session.commit()
     if call.status == "failed":
         raise last_error or ValueError("OCR_FAILED")
@@ -202,8 +222,8 @@ def _run_ocr(
         action="ocr_page_processed",
         status="completed",
         source_ref=f"page:{page_no}",
-        tool_name="ocr",
-        tool_version=settings.ocr_model,
+        tool_name=settings.ocr_provider,
+        tool_version=OCR_PARSER_VERSION,
         input_hash=page_hash,
         output_hash=call.response_hash,
         detail={
@@ -222,25 +242,35 @@ def _run_ocr(
 def _run_ocr_document(session: Session, job: ExtractionJob, filing: FilingVersion,
                       document, path, owner: str) -> None:
     """Only render pixels; OCR candidates require explicit manual fact mapping."""
-    if not (settings.ocr_base_url and settings.ocr_api_key and settings.ocr_model):
+    from finance_adapters.providers.model_clients import BaiduUnlimitedOCRAdapter
+
+    if BaiduUnlimitedOCRAdapter.is_retired_ocr(settings.ocr_provider, settings.ocr_model):
+        raise ValueError("OCR_LEGACY_PROVIDER_RETIRED_CONFIGURE_UNLIMITED_OCR")
+    if not (settings.ocr_base_url and settings.ocr_model):
         raise ValueError("OCR_NOT_CONFIGURED")
     client = ModelClient(ModelConfig(
         settings.ocr_provider, settings.ocr_base_url, settings.ocr_api_key,
-        settings.ocr_model, settings.ocr_timeout_seconds,
+        settings.ocr_model,
+        timeout=settings.ocr_timeout_seconds,
+        protocol=settings.ocr_protocol,
+        secret_key=settings.ocr_secret_key,
+        poll_interval=settings.ocr_poll_interval_seconds,
     ))
     table_count = 0
     pages_with_tables = []
-    for index, page in enumerate(document):
+    page_numbers = selected_pages(document, job.page_numbers)
+    for index, page_no in enumerate(page_numbers):
+        page = document[page_no - 1]
         session.refresh(job)
         if job.status != "running" or job.owner_token != owner:
             session.rollback()
             return
-        _text, count = _run_ocr(session, job, filing, page, index + 1, client)
+        _text, count = _run_ocr(session, job, filing, page, page_no, client)
         table_count += count
         if count:
-            pages_with_tables.append(index + 1)
+            pages_with_tables.append(page_no)
         if not transition_extraction(session, job.id, owner, progress=max(
-            5, int((index + 1) / max(len(document), 1) * 90),
+            5, int((index + 1) / max(len(page_numbers), 1) * 90),
         )):
             session.rollback()
             return
@@ -284,7 +314,7 @@ def _run_ocr_document(session: Session, job: ExtractionJob, filing: FilingVersio
     filing.status = "needs_review"
     record_audit_event(
         session, filing.id, category="tool", action="pdf_extraction_completed", status="completed",
-        source_ref=filing.object_key, tool_name="ocr", tool_version=OCR_PARSER_VERSION,
+        source_ref=filing.object_key, tool_name=settings.ocr_provider, tool_version=OCR_PARSER_VERSION,
         input_hash=filing.file_sha256,
         output_hash=stable_hash({"job_id": job.id, "table_count": table_count,
                                  "pages": pages_with_tables, "extraction_method": "ocr"}),
@@ -292,6 +322,64 @@ def _run_ocr_document(session: Session, job: ExtractionJob, filing: FilingVersio
                 "table_count": table_count, "statement_pages": pages_with_tables,
                 "facts_admitted": False, "review_required": True,
                 "reason": "OCR_FACT_MAPPING_REQUIRED"},
+    )
+    session.commit()
+    session.refresh(job)
+
+
+def _run_supplemental_document(session: Session, job: ExtractionJob, filing: FilingVersion,
+                               document, owner: str) -> None:
+    """Make interim reports searchable without admitting unaudited strict facts."""
+    from finance_adapters.providers.evidence_retrieval import materialize_document_text_chunks
+
+    if job.extraction_method == "ocr":
+        if not (settings.ocr_base_url and settings.ocr_model):
+            raise ValueError("OCR_NOT_CONFIGURED")
+        client = ModelClient(ModelConfig(
+            settings.ocr_provider, settings.ocr_base_url, settings.ocr_api_key, settings.ocr_model,
+            timeout=settings.ocr_timeout_seconds, protocol=settings.ocr_protocol,
+            poll_interval=settings.ocr_poll_interval_seconds,
+            secret_key=getattr(settings, "ocr_secret_key", ""),
+        ))
+        page_numbers = selected_pages(document, job.page_numbers)
+        for index, page_no in enumerate(page_numbers):
+            page = document[page_no - 1]
+            session.refresh(job)
+            if job.status != "running" or job.owner_token != owner:
+                session.rollback()
+                return
+            _run_ocr(session, job, filing, page, page_no, client)
+            if not transition_extraction(session, job.id, owner,
+                                         progress=int((index + 1) / max(len(page_numbers), 1) * 90)):
+                session.rollback()
+                return
+            session.commit()
+    # Docling conversion may take minutes. Do it before flushing monetary
+    # candidates so SQLite's writer lock stays free for the lease heartbeat.
+    # Both candidate sets still commit atomically with fenced completion below.
+    result = materialize_document_text_chunks(session, filing.id)
+    if not result.get("chunk_count"):
+        raise ValueError("SUPPLEMENT_TEXT_NOT_EXTRACTED")
+    if job.extraction_method == "pdf_text":
+        from finance_adapters.persistence.report_measure_gateway import extract_and_persist_measures
+        extract_and_persist_measures(session, filing, job, document)
+    if not transition_extraction(
+        session, job.id, owner, status="completed", stage="needs_review", progress=100,
+        finished_at=datetime.now(UTC), owner_token=None, lease_expires_at=None,
+    ):
+        session.rollback()
+        return
+    filing.status = "needs_review"
+    record_audit_event(
+        session, filing.id, category="tool", action="supplement_text_extraction_completed",
+        status="completed", source_ref=filing.object_key, tool_name="document_chunk_materializer",
+        tool_version="supplement-text-v1", input_hash=filing.file_sha256,
+        output_hash=stable_hash(result),
+        detail={"extraction_job_id": job.id, "extraction_method": job.extraction_method,
+                "report_type": filing.report_type, "chunk_count": result["chunk_count"],
+                "page_numbers": job.page_numbers,
+                "review_required": True, "facts_admitted": False,
+                "limitation": "Report text and located monetary candidates require human review; annual audited metrics use a separate assurance gate."},
     )
     session.commit()
     session.refresh(job)
@@ -314,15 +402,17 @@ def run_extraction(session: Session, job_id: int) -> None:
     heartbeat.start()
     document = None
     try:
-        if filing.period_basis != "annual" or filing.report_type != "annual":
+        interim = filing.period_basis in {"semi_annual", "quarterly"}
+        if filing.report_type != filing.period_basis or not (interim or filing.period_basis == "annual"):
             raise ValueError("UNSUPPORTED_STRICT_PERIOD")
         if filing.scope != "consolidated":
             raise ValueError("UNSUPPORTED_STRICT_SCOPE")
-        if (
+        if not interim and (
             filing.period_start.isoformat() != f"{filing.period_end.year}-01-01"
             or filing.period_end.isoformat() != f"{filing.period_end.year}-12-31"
         ):
             raise ValueError("ANNUAL_PERIOD_MISMATCH")
+        validate_report_period(filing)
         if job.extraction_method not in {"pdf_text", "ocr"}:
             raise ValueError("UNSUPPORTED_EXTRACTION_METHOD")
         path = scanned_object_path(session, filing)
@@ -336,19 +426,25 @@ def run_extraction(session: Session, job_id: int) -> None:
             action="pdf_extraction_started",
             status="running",
             source_ref=filing.object_key,
-            tool_name="ocr" if job.extraction_method == "ocr" else "pymupdf",
+            tool_name=settings.ocr_provider if job.extraction_method == "ocr" else "pymupdf",
             tool_version=parser_version,
             input_hash=filing.file_sha256,
             detail={"extraction_job_id": job_id, "parser_version": parser_version,
-                    "extraction_method": job.extraction_method},
+                    "extraction_method": job.extraction_method, "page_numbers": job.page_numbers},
         )
         session.commit()
         document = fitz.open(path)
         if document.is_encrypted:
             raise ValueError("ENCRYPTED_PDF_UNSUPPORTED")
+        selected_pages(document, job.page_numbers)
+        if interim or job.page_numbers is not None:
+            _run_supplemental_document(session, job, filing, document, owner)
+            return
         if job.extraction_method == "ocr":
             _run_ocr_document(session, job, filing, document, path, owner)
             return
+        from finance_adapters.persistence.report_measure_gateway import extract_and_persist_measures
+        extract_and_persist_measures(session, filing, job, document)
         page_texts = [page.get_text("text") for page in document]
         disclosures = document_annual_disclosures(document, page_texts, filing.period_end.year)
         extractor = StatementExtractor(
@@ -633,7 +729,7 @@ def run_extraction(session: Session, job_id: int) -> None:
             action="pdf_extraction_failed",
             status="failed",
             source_ref=filing.object_key,
-            tool_name="ocr" if job.extraction_method == "ocr" else "pymupdf",
+            tool_name=settings.ocr_provider if job.extraction_method == "ocr" else "pymupdf",
             tool_version=job.parser_version,
             input_hash=filing.file_sha256,
             detail={"extraction_job_id": job_id, "error_code": error_code, "error": detail,

@@ -56,6 +56,15 @@ def _env_structured_output_mode() -> str:
     return value
 
 
+def _env_ocr_protocol() -> str:
+    value = os.getenv("FINREPORT_OCR_PROTOCOL", "auto").strip().lower().replace("-", "_")
+    if value not in {"auto", "openai_compatible", "baidu_cloud", "local", "http", "cloud"}:
+        raise ValueError(
+            "FINREPORT_OCR_PROTOCOL must be auto, openai_compatible, baidu_cloud, local, http or cloud"
+        )
+    return value
+
+
 class Settings:
     database_url = os.getenv("FINREPORT_DATABASE_URL", "sqlite:///./data/finreport.db")
     storage_dir = Path(os.getenv("FINREPORT_STORAGE_DIR", "./data/storage"))
@@ -67,14 +76,45 @@ class Settings:
     llm_timeout_seconds = _env_positive_float("FINREPORT_LLM_TIMEOUT_SECONDS", 120.0)
     llm_enable_thinking = _env_optional_bool("FINREPORT_LLM_ENABLE_THINKING")
     llm_reasoning_effort = os.getenv("FINREPORT_LLM_REASONING_EFFORT", "").strip() or None
+    llm_stream = _env_optional_bool("FINREPORT_LLM_STREAM") or False
+    llm_provider_sort = os.getenv("FINREPORT_LLM_PROVIDER_SORT", "").strip() or None
     llm_structured_output_mode = _env_structured_output_mode()
-    ocr_provider = os.getenv("FINREPORT_OCR_PROVIDER", "openai")
-    ocr_base_url = os.getenv("FINREPORT_OCR_BASE_URL", llm_base_url or "")
-    ocr_api_key = os.getenv("FINREPORT_OCR_API_KEY", llm_api_key or "")
-    ocr_model = os.getenv("FINREPORT_OCR_MODEL", "")
-    ocr_timeout_seconds = float(os.getenv("FINREPORT_OCR_TIMEOUT_SECONDS", "60"))
+    # Bound actions, not tokens. Each accepted round is checkpointed for resume.
+    analysis_agent_max_rounds = int(os.getenv("FINREPORT_ANALYSIS_AGENT_MAX_ROUNDS", "16"))
+    ocr_provider = os.getenv("FINREPORT_OCR_PROVIDER", "baidu-unlimited-ocr")
+    # OCR credentials are independent of the analysis provider.  A missing OCR
+    # endpoint must never send financial-report images to the analysis service.
+    ocr_base_url = os.getenv("FINREPORT_OCR_BASE_URL", "")
+    ocr_api_key = os.getenv("FINREPORT_OCR_API_KEY", "")
+    ocr_secret_key = os.getenv("FINREPORT_OCR_SECRET_KEY", "")
+    ocr_model = os.getenv("FINREPORT_OCR_MODEL", "baidu/Unlimited-OCR")
+    ocr_protocol = _env_ocr_protocol()
+    ocr_prompt = os.getenv("FINREPORT_OCR_PROMPT", "<image>document parsing.")
+    ocr_timeout_seconds = _env_positive_float("FINREPORT_OCR_TIMEOUT_SECONDS", 120.0)
+    ocr_poll_interval_seconds = _env_positive_float("FINREPORT_OCR_POLL_INTERVAL_SECONDS", 5.0)
     ocr_max_retries = int(os.getenv("FINREPORT_OCR_MAX_RETRIES", "2"))
     ocr_max_page_bytes = int(os.getenv("FINREPORT_OCR_MAX_PAGE_BYTES", str(8 * 1024 * 1024)))
+    # Evidence retrieval uses Qdrant when explicitly configured.  The
+    # application never depends on the service being reachable: the retrieval
+    # adapter falls back to deterministic SQLite ranking for local and offline
+    # runs.  A fixed hashed-vector dimension keeps indexing reproducible even
+    # when no external embedding service is installed.
+    qdrant_url = os.getenv("FINREPORT_QDRANT_URL", "").rstrip("/")
+    qdrant_api_key = os.getenv("FINREPORT_QDRANT_API_KEY", "")
+    qdrant_collection = os.getenv("FINREPORT_QDRANT_COLLECTION", "finreport_document_chunks")
+    qdrant_timeout_seconds = _env_positive_float("FINREPORT_QDRANT_TIMEOUT_SECONDS", 5.0)
+    qdrant_vector_size = int(os.getenv("FINREPORT_QDRANT_VECTOR_SIZE", "256"))
+    # Preferred protocol: the official mcp-server-qdrant streamable HTTP
+    # endpoint.  The REST URL above is a separately named lexical-vector
+    # adapter, never silently described as MCP or semantic search.
+    qdrant_mcp_url = os.getenv("FINREPORT_QDRANT_MCP_URL", "").rstrip("/")
+    qdrant_mcp_token = os.getenv("FINREPORT_QDRANT_MCP_TOKEN", "")
+    qdrant_enabled = _env_bool("FINREPORT_QDRANT_ENABLED", bool(qdrant_mcp_url or qdrant_url))
+    docling_enabled = _env_bool("FINREPORT_DOCLING_ENABLED", False)
+    docling_mcp_url = os.getenv("FINREPORT_DOCLING_MCP_URL", "http://127.0.0.1:18769/mcp")
+    docling_mcp_timeout_seconds = _env_positive_float("FINREPORT_DOCLING_MCP_TIMEOUT_SECONDS", 300.0)
+    docling_artifact_dir = Path(os.getenv("FINREPORT_DOCLING_ARTIFACT_DIR", "data/local-services/mcp/docling-artifacts"))
+    docling_mcp_cache_dir = Path(os.getenv("FINREPORT_DOCLING_MCP_CACHE_DIR", "data/local-services/mcp/docling-output"))
     task_backend = os.getenv("FINREPORT_TASK_BACKEND", "background")
     api_key = os.getenv("FINREPORT_API_KEY")
     storage_backend = os.getenv("FINREPORT_STORAGE_BACKEND", "local")

@@ -13,7 +13,7 @@ from finance_adapters.persistence.audit import stable_hash
 from finance_adapters.persistence.models import ExtractionJob, FilingVersion, OcrCall
 from finance_adapters.security.file_gate import scanned_object_path
 
-CONTEXT_VERSION = "native-context-v2"
+CONTEXT_VERSION = "native-context-v5"
 MAX_CONTEXT_CHARACTERS = 18000
 MAX_EXCERPTS = 48
 MAX_EXCERPT_CHARACTERS = 1600
@@ -53,12 +53,33 @@ def _page_lines(page, page_no: int) -> list[dict]:
     return lines
 
 
-def extract_document_context(path: Path, source_sha256: str) -> dict:
+def _narrative_window(lines: list[dict], index: int, covered: set[int]) -> tuple[int, int]:
+    """Expand keyword windows to sentence boundaries without inventing missing text."""
+    terminal = re.compile(r"[。！？.!?][”’\"）)]?$")
+    heading = re.compile(r"^(?:[一二三四五六七八九十]+[、．.]|\d+[、．.]|[（(][一二三四五六七八九十\d]+[）)])")
+    start, stop = index, index + 1
+    while start > 0 and start - 1 not in covered:
+        previous = lines[start - 1]["text"].strip()
+        if terminal.search(previous) or heading.match(previous):
+            break
+        start -= 1
+    while stop < len(lines) and stop not in covered:
+        if terminal.search(lines[stop - 1]["text"].strip()) or heading.match(lines[stop]["text"].strip()):
+            break
+        stop += 1
+    return start, stop
+
+
+def extract_document_context(path: Path, source_sha256: str, page_numbers: list[int] | None = None) -> dict:
     """Read native geometry, retaining checkbox answers with their question context."""
     candidates = []
     page_index = []
     with pymupdf.open(path) as document:
+        total_pages = document.page_count
+        allowed = None if page_numbers is None else set(page_numbers)
         for page_no, page in enumerate(document, 1):
+            if allowed is not None and page_no not in allowed:
+                continue
             native = page.get_text("text")
             lines = _page_lines(page, page_no)
             page_hash = hashlib.sha256(native.encode("utf-8")).hexdigest()
@@ -87,7 +108,7 @@ def extract_document_context(path: Path, source_sha256: str) -> dict:
             for index, line in enumerate(lines):
                 if index in covered or not TOPIC.search(line["text"]):
                     continue
-                start, stop = max(0, index - 1), min(len(lines), index + 3)
+                start, stop = _narrative_window(lines, index, covered)
                 # Never create an answer-free subwindow of a known checkbox question.
                 while start < stop and start in covered:
                     start += 1
@@ -106,7 +127,22 @@ def extract_document_context(path: Path, source_sha256: str) -> dict:
                     continue
                 consumed.add(ids)
                 selected = {match.group(1) for _, match in nearby_checked}
-                text = "\n".join(item["text"] for item in lines[start:stop])
+                raw_text = "\n".join(item["text"] for item in lines[start:stop])
+                # Preserve the PDF, raw text hash and line locations. Private
+                # font glyphs already recognized as checked options get a
+                # visible Unicode equivalent; unrelated glyphs, indentation
+                # and internal whitespace stay intact.
+                text = raw_text.rstrip(" \t\r\n")
+                glyphs = list(text)
+                normalization_edits = []
+                for match in CHECKED_OPTION.finditer(text):
+                    original = text[match.start()]
+                    if original in {"\uf052", "\uf0fe"}:
+                        glyphs[match.start()] = "☑"
+                        normalization_edits.append({
+                            "offset": match.start(), "original": original, "replacement": "☑",
+                        })
+                text = "".join(glyphs)
                 excerpt = {
                     "id": f"p{page_no:03d}-context-{start + 1:04d}-{stop:04d}",
                     "page_no": page_no, "line_ids": list(ids), "context_line_ids": list(ids),
@@ -116,6 +152,11 @@ def extract_document_context(path: Path, source_sha256: str) -> dict:
                         max(item["bbox"][2] for item in lines[start:stop]),
                         max(item["bbox"][3] for item in lines[start:stop]),
                     ], "page_sha256": page_hash, "text_sha256": stable_hash(text),
+                    "raw_text_sha256": stable_hash(raw_text),
+                    "raw_text": raw_text,
+                    "raw_lines": [dict(item) for item in lines[start:stop]],
+                    "text_normalization": "right_edge_ascii_whitespace_and_checked_font_glyph_v1",
+                    "normalization_edits": normalization_edits,
                     "selected_answer": next(iter(selected)) if len(selected) == 1 else None,
                     "selection_status": "ambiguous" if len(nearby_checked) > 1 else
                     "selected" if selected else "not_a_checkbox",
@@ -146,7 +187,7 @@ def extract_document_context(path: Path, source_sha256: str) -> dict:
         "status": "available" if excerpts else "no_matching_native_context",
         "source_sha256": source_sha256, "extractor_version": CONTEXT_VERSION,
         "pymupdf_version": pymupdf.VersionBind,
-        "total_pages": len(page_index),
+        "total_pages": total_pages,
         "native_text_pages": sum(p["native_characters"] > 0 for p in page_index),
         "scanned_page_numbers": [p["page_no"] for p in page_index],
         "selected_page_numbers": sorted({item["page_no"] for item in excerpts}),
@@ -173,7 +214,10 @@ def _ocr_document_context(session: Session, filing: FilingVersion, job: Extracti
         OcrCall.extraction_job_id == job.id,
     ).order_by(OcrCall.id)))
     latest = {}
+    allowed = None if job.page_numbers is None else set(job.page_numbers)
     for call in calls:
+        if allowed is not None and call.page_no not in allowed:
+            continue
         if job.started_at is not None and call.started_at is not None and call.started_at >= job.started_at:
             latest[call.page_no] = call
     excerpts, characters, candidates, incomplete = [], 0, 0, 0
@@ -240,4 +284,4 @@ def build_document_context(session: Session, filing: FilingVersion) -> dict:
             "total_pages": None, "native_text_pages": None, "selected_page_numbers": [],
             "model_input_line_count": 0, "excerpts": [], "limitations": LIMITATIONS,
         }
-    return extract_document_context(path, filing.file_sha256)
+    return extract_document_context(path, filing.file_sha256, job.page_numbers if job is not None else None)

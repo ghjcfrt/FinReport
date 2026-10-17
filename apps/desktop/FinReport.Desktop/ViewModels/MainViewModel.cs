@@ -52,7 +52,7 @@ public partial class MainViewModel(FinReportApiClient api) : ObservableObject
     [ObservableProperty] private string analysisBaseUrl = "";
     [ObservableProperty] private string analysisApiKey = "";
     [ObservableProperty] private string analysisModel = "";
-    [ObservableProperty] private string ocrProvider = "openai";
+    [ObservableProperty] private string ocrProvider = "baidu-unlimited-ocr";
     [ObservableProperty] private string ocrBaseUrl = "";
     [ObservableProperty] private string ocrApiKey = "";
     [ObservableProperty] private string ocrModel = "";
@@ -255,6 +255,9 @@ public partial class MainViewModel(FinReportApiClient api) : ObservableObject
     private async Task UploadAsync()
     {
         if (!CanSubmit) return;
+        int[]? pageNumbers;
+        try { pageNumbers = ReadSelectedPageNumbers(); }
+        catch (Exception ex) { ErrorMessage = ex.Message; return; }
         var extractionMethod = SelectedExtractionMethod;
         ActiveExtractionMethod = extractionMethod;
         IsBusy = true;
@@ -263,6 +266,7 @@ public partial class MainViewModel(FinReportApiClient api) : ObservableObject
         CanStartAnalysis = false;
         Facts.Clear();
         ClearAnnualDisclosures();
+        ClearReportData();
         _originalTables = [];
         OriginalTablePages.Clear();
         OriginalTables.Clear();
@@ -271,14 +275,19 @@ public partial class MainViewModel(FinReportApiClient api) : ObservableObject
         OriginalTableSummary = "原表：等待解析。";
         MetricsSummary = "指标：等待事实复核";
         AnalysisSummary = "分析：未生成";
+        AnalysisReasoningSummary = "供应商思考文本：尚无已保存的模型调用。";
+        CanResumeAnalysis = false;
+        _analysisRunId = 0;
+        _analysisFilingId = 0;
         ExportSummary = "导出：未生成";
         try
         {
             StatusMessage = "正在上传…";
             using var cancellation = BeginExtractionTracking();
-            var filingId = await api.UploadAsync(SelectedFilePath, StockCode, CompanyName, ReportYear, cancellation.Token);
+            var filingId = await api.UploadDocumentAsync(SelectedFilePath, StockCode, CompanyName,
+                ReportYear, SelectedReportPeriod, cancellation.Token);
             _filingId = filingId;
-            var jobId = await api.StartJobAsync(filingId, extractionMethod, cancellation.Token);
+            var jobId = await api.StartJobAsync(filingId, extractionMethod, pageNumbers, cancellation.Token);
             _jobId = jobId;
             await TrackExtractionAsync(jobId, cancellation.Token);
         }
@@ -309,6 +318,11 @@ public partial class MainViewModel(FinReportApiClient api) : ObservableObject
                 if (job.Status == "completed")
                 {
                     await RefreshFactsAsync(cancellationToken);
+                    if (ActiveExtractionMethod == "pdf_text")
+                    {
+                        try { await LoadReportDataAsync(cancellationToken); }
+                        catch (Exception ex) { ReportDataSummary = $"报告金额候选暂不可用：{ex.Message}"; }
+                    }
                     StatusMessage = ActiveExtractionMethod == "ocr"
                         ? "OCR 识别完成。请在原表中打开人工映射，补齐原图定位证据、科目与期间，确认审计意见后，再逐条完成人工事实审核。"
                         : "提取完成，需逐项核对原文并完成人工事实审核，才可计算指标与启动分析。";
@@ -327,21 +341,14 @@ public partial class MainViewModel(FinReportApiClient api) : ObservableObject
         try
         {
             CanStartAnalysis = false;
-            using var cancellation = new CancellationTokenSource(TimeSpan.FromMinutes(5));
+            using var cancellation = new CancellationTokenSource(TimeSpan.FromMinutes(30));
+            AnalysisReasoningSummary = "供应商思考文本：等待本次模型调用。";
             var runId = await api.StartAnalysisAsync(_filingId, cancellation.Token);
+            _analysisRunId = runId;
+            _analysisFilingId = _filingId;
+            CanResumeAnalysis = false;
             StatusMessage = $"分析任务：{runId}，正在生成并校验…";
-            while (true)
-            {
-                var run = await api.GetAnalysisAsync(runId, cancellation.Token);
-                if (run.Status == "completed")
-                {
-                    AnalysisSummary = run.Output is JsonElement output ? JsonSerializer.Serialize(output, new JsonSerializerOptions { WriteIndented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping }) : "分析未返回内容";
-                    StatusMessage = "分析完成，数值与公式已校验；推断仍需人工复核。";
-                    break;
-                }
-                if (run.Status is "failed" or "invalidated") throw new InvalidOperationException(run.FailureReason ?? run.Status);
-                await Task.Delay(1000, cancellation.Token);
-            }
+            await TrackAnalysisAsync(runId, cancellation.Token);
             await RefreshAuditTrailAsync(CancellationToken.None);
         }
         catch (Exception ex) { ErrorMessage = ex.Message; }
@@ -477,10 +484,11 @@ public partial class MainViewModel(FinReportApiClient api) : ObservableObject
     [RelayCommand]
     private async Task ExportAsync()
     {
-        if (_filingId == 0) return;
+        var reportFilingId = _analysisFilingId != 0 ? _analysisFilingId : _filingId;
+        if (reportFilingId == 0) return;
         try
         {
-            var url = await api.CreateExportAsync(_filingId, "html", CancellationToken.None);
+            var url = await api.CreateExportAsync(reportFilingId, "html", CancellationToken.None);
             if (url is null) throw new InvalidOperationException("导出未返回下载地址。");
             var dialog = new SaveFileDialog { Filter = "HTML 报告 (*.html)|*.html", FileName = $"财报分析-{StockCode}-{ReportYear}.html" };
             if (dialog.ShowDialog() == true)

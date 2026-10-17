@@ -241,7 +241,12 @@ public sealed record OriginalTableRow(
     double[]? RowBbox = null);
 public sealed record ValidationSummary(string FilingStatus, ValidationItem[] Results);
 public sealed record ValidationItem(string RuleCode, string Status, string? ActualValue, string? ExpectedValue);
-public sealed record AnalysisStatus(string Status, JsonElement? Output, string? FailureReason);
+public sealed record AnalysisStatus(string Status, JsonElement? Output, string? FailureReason,
+    ProviderReasoningView? ProviderReasoning = null);
+public sealed record ProviderReasoningView(string Status, ProviderReasoningCall[] Calls);
+public sealed record ProviderReasoningCall(string Stage, int CallIndex, string Status,
+    bool? ThinkingEnabled, ProviderReasoningField[] Fields);
+public sealed record ProviderReasoningField(string Field, string Content);
 public sealed record MetricItem(long Id, string MetricCode, decimal? Value, string Unit, string FormulaVersion, string ApplicabilityStatus, string ComputationMode, string QualityStatus, string Scope, string PeriodBasis);
 public sealed record ExportItem(string Status, string Format, string DownloadUrl);
 public sealed record AuditTrail(long FilingVersionId, ReproductionInfo Reproduction, AuditEventItem[] Events);
