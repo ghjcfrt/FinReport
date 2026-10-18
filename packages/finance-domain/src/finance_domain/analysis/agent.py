@@ -106,10 +106,13 @@ class AgentWorkflowResult(BaseModel):
     limitations: list[str] = Field(default_factory=list)
     coverage_policy: str | None = None
     evidence_coverage: dict | None = None
+    obligation_tasks: list[dict] | None = None
 
     @model_serializer(mode="wrap")
     def _serialize_optional_coverage(self, handler):
         value = handler(self)
         if value.get("evidence_coverage") is None:
             value.pop("evidence_coverage", None)
+        if value.get("obligation_tasks") is None:
+            value.pop("obligation_tasks", None)
         return value

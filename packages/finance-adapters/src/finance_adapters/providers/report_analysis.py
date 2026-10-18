@@ -110,7 +110,10 @@ def create_report_analysis(session: Session, filing_id: int,
 
 
 def run_report_analysis(session: Session, run_id: int) -> None:
-    from finance_adapters.providers.analysis_agent import run_evidence_workflow
+    from finance_adapters.providers.analysis_agent import (
+        OBLIGATION_TASK_POLICY_V1,
+        run_evidence_workflow,
+    )
     run = session.get(AnalysisRun, run_id)
     if run is None or run.status != "queued":
         return
@@ -147,7 +150,8 @@ def run_report_analysis(session: Session, run_id: int) -> None:
             session.commit()
 
         filing = session.get(FilingVersion, run.filing_version_id)
-        workflow = run_evidence_workflow(session, filing, package, client, trace, save_checkpoint=checkpoint)
+        workflow = run_evidence_workflow(session, filing, package, client, trace,
+            save_checkpoint=checkpoint, coverage_policy=OBLIGATION_TASK_POLICY_V1)
         if workflow is None:
             raise ValueError("REPORT_ANALYSIS_SEARCHABLE_TEXT_REQUIRED")
         session.refresh(run)

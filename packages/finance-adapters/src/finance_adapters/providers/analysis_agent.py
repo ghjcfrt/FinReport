@@ -41,6 +41,7 @@ from finance_adapters.persistence.metric_gateway import (
 )
 from finance_adapters.persistence.models import FilingVersion
 from finance_adapters.providers import evidence_retrieval as retrieval
+from finance_adapters.providers.cashflow_units import reconciliation_units
 from finance_adapters.providers.evidence_completeness import (
     REPAIR_LIMIT,
     build_manifest,
@@ -49,11 +50,16 @@ from finance_adapters.providers.evidence_completeness import (
     row_source_units,
     validate_item_assessments,
 )
+from finance_adapters.providers.financial_semantics import FinancialSemanticError, semantic_issues
 from finance_adapters.providers.model_clients import (
     ModelClient,
     ModelConfig,
     ModelRequestError,
     json_text,
+)
+from finance_adapters.providers.source_registry import (
+    build_source_registry,
+    resolve_registered_sources,
 )
 
 WORKFLOW_VERSION = "financial-evidence-agent-v11"
@@ -92,9 +98,14 @@ V10_QUESTION_UNIT_POLICY_VERSION = "closed_question_with_unique_selection_v2"
 OBLIGATION_COVERAGE_POLICY_VERSION = "evidence_obligations_v1"
 OBLIGATION_COVERAGE_POLICY_V2 = "evidence_obligations_v2"
 OBLIGATION_COVERAGE_POLICY_V3 = "evidence_obligations_v3"
+OBLIGATION_TASK_POLICY_V1 = "evidence_obligation_tasks_v1"
+ROW_COVERAGE_POLICIES = {OBLIGATION_COVERAGE_POLICY_V3, OBLIGATION_TASK_POLICY_V1}
 SUPPORTED_OBLIGATION_POLICIES = {OBLIGATION_COVERAGE_POLICY_VERSION, OBLIGATION_COVERAGE_POLICY_V2,
-                                OBLIGATION_COVERAGE_POLICY_V3}
-LOCAL_EVIDENCE_POLICIES = {OBLIGATION_COVERAGE_POLICY_V2, OBLIGATION_COVERAGE_POLICY_V3}
+                                OBLIGATION_COVERAGE_POLICY_V3, OBLIGATION_TASK_POLICY_V1}
+LOCAL_EVIDENCE_POLICIES = {OBLIGATION_COVERAGE_POLICY_V2, OBLIGATION_COVERAGE_POLICY_V3,
+                           OBLIGATION_TASK_POLICY_V1}
+OBLIGATION_TASK_BATCH_LIMIT = 20
+OBLIGATION_TASK_ATTEMPT_LIMIT = 3
 INDEPENDENT_NOTE_POLICY_VERSION = "parent_bound_complete_independent_note_v1"
 INSUFFICIENCY_STATEMENT = "现有材料尚不足以确认本主题事项。"
 INSUFFICIENCY_RATIONALE = "尚需核对完整披露，保留证据判断边界。"
@@ -299,6 +310,16 @@ ROW_CONTEXT_V2_AGENT_SYSTEM_PROMPT = ROW_CONTEXT_AGENT_SYSTEM_PROMPT.replace(
 ) + """\n定向补分析协议：
 findings每轮最多二十条，不必同轮完成所有主题。定向补分析仅提交pending_item_ids对应行的修正候选，已接受项由服务端保留，禁止重写全量。已有可见行原文时直接finish，不再read_chunks或补交其他主题；参照row_candidate_protocol.example，只自行完成该行具体reason。
 主标签仅用于可观察项目锚点，原始完整限定语仍须逐字呈现，不证明限定语已被正确理解。说明栏“无”应写“该表该行说明栏标注无，解释边界仍需形成原因或确认依据”，不能写公司全文未披露。
+"""
+OBLIGATION_TASK_AGENT_SYSTEM_PROMPT = ROW_CONTEXT_V2_AGENT_SYSTEM_PROMPT + """\n独立子命题任务协议 evidence_obligation_tasks_v1：
+本轮只处理obligation_tasks中列出的义务，最多二十项；findings每项必须带对应obligation_id，禁止改写、删除或替代任务清单。
+不同义务独立提交；某项协议错误、来源不可用或语义校验失败不影响其他合格候选。EPS已有finding须保留，不重复生成。
+company_disclosure的assessment必须为observation；披露事实不能冒充分析推断。不得把现金流调节表本身说成回款、结算、销量或售价变化的业务原因。
+协议或引用被拒绝不等于证据不足；一次检索未命中不等于未披露。只在读取并分析了可用材料后才能提交evidence_insufficient。
+补分析只针对obligation_tasks列出的未完成义务。每项最多尝试三次；到达上限后保留具体失败状态，不生成“证据不足”替代协议/来源错误。
+本独立任务协议优先于上文旧逐行协议：findings可同时处理多种义务，不仅限非经常性损益行；不为遗漏义务自动补写结论。
+无引用证据不足必须逐字使用unreferenced_insufficiency_template中的statement和rationale，两者都不得扩写。具体需核对章节写入material_requirements，不写成“未披露/未见/不存在”。只表明当前证据不能支撑判断，不表明已经查遍财报。
+现金流业务原因的边界判断应表达“所引调节表不能独立支持具体业务因果判断”，不要断言现有材料未披露原因、不要把应收项目直接称为回款原因。调节表优先引用complete_cashflow_reconciliation的source_unit_id，statement仅填公司披露：。
 """
 
 
@@ -1282,9 +1303,11 @@ def _selectable_source_units(source: dict, *, version: str = WORKFLOW_VERSION,
     units = _complete_table_units(source["text"]) + _complete_question_units(source, version=version)
     if version == V11_WORKFLOW_VERSION:
         units.extend(_cashflow_subtable_units_v11(source))
+        if coverage_policy == OBLIGATION_TASK_POLICY_V1:
+            units.extend(reconciliation_units(source))
         if coverage_policy in LOCAL_EVIDENCE_POLICIES:
             units.extend(_independent_note_units(source))
-        if coverage_policy == OBLIGATION_COVERAGE_POLICY_V3:
+        if coverage_policy in ROW_COVERAGE_POLICIES:
             units.extend(row_source_units(source))
     return [{**unit, "source_unit_id": "unit-" + stable_hash({
                 "parent_source_id": source["id"], "parent_text_sha256": source["text_sha256"],
@@ -1305,7 +1328,7 @@ def _validate_finding(candidate: FindingCandidate, sources: dict[str, dict], pac
         if obligation_topic != candidate.topic:
             raise ValueError("AGENT_OBLIGATION_TOPIC_MISMATCH")
     if (getattr(candidate, "evidence_item_assessments", None) is not None
-            and coverage_policy != OBLIGATION_COVERAGE_POLICY_V3):
+            and coverage_policy not in ROW_COVERAGE_POLICIES):
         raise ValueError("AGENT_EVIDENCE_ITEM_POLICY_REQUIRED")
     if (version in {V8_WORKFLOW_VERSION, V9_WORKFLOW_VERSION, V10_WORKFLOW_VERSION, V11_WORKFLOW_VERSION} and candidate.evidence_kind == "analysis_inference"
             and candidate.rationale.endswith(INFERENCE_RATIONALE_SUFFIX)):
@@ -1402,6 +1425,10 @@ def _validate_finding(candidate: FindingCandidate, sources: dict[str, dict], pac
             _validate_explanation(text)
     if candidate.assessment == "not_identified_in_checked_scope" and not selected:
         raise ValueError("AGENT_CHECKED_SCOPE_REQUIRES_SOURCES")
+    if coverage_policy == OBLIGATION_TASK_POLICY_V1:
+        issues = semantic_issues(candidate, selected)
+        if issues:
+            raise FinancialSemanticError(issues)
     payload = candidate.model_dump(mode="json")
     # ``obligation_id`` was added in v11.  A null field must not participate in
     # the finding hash for legacy workflows, otherwise replay changes the IDs
@@ -1427,7 +1454,7 @@ def _validate_disclosure_excerpt(statement: str, source: dict, *, version: str =
         raise ValueError("AGENT_COMPANY_DISCLOSURE_EXCERPT_LENGTH_INVALID")
     if version == V11_WORKFLOW_VERSION and _note_quote_unit(statement, source, coverage_policy=coverage_policy):
         return
-    if (coverage_policy == OBLIGATION_COVERAGE_POLICY_V3 and any(
+    if (coverage_policy in ROW_COVERAGE_POLICIES and any(
             excerpt == text[unit["start"]:unit["end"]] for unit in row_source_units(source))):
         return
     checkbox = (source.get("selected_answer") is not None
@@ -1444,6 +1471,8 @@ def _validate_disclosure_excerpt(statement: str, source: dict, *, version: str =
     units = _complete_table_units(text) if version in COMPLETE_UNIT_WORKFLOW_VERSIONS else []
     if version == V11_WORKFLOW_VERSION:
         units.extend(_cashflow_subtable_units_v11(source))
+        if coverage_policy == OBLIGATION_TASK_POLICY_V1:
+            units.extend(reconciliation_units(source))
     # A substring alone is insufficient: it could drop a preceding negation or
     # a qualifier. Only complete sentences/paragraphs are eligible boundaries.
     start = text.find(excerpt)
@@ -1908,20 +1937,24 @@ def _obligation_enabled(*, version: str = WORKFLOW_VERSION, coverage_policy: str
     return version == WORKFLOW_VERSION and coverage_policy in SUPPORTED_OBLIGATION_POLICIES
 
 
-def _obligation_evidence(sources: list[dict]) -> dict[str, list[dict]]:
+def _obligation_evidence(sources: list[dict], *, coverage_policy: str = OBLIGATION_COVERAGE_POLICY_V2) -> dict[str, list[dict]]:
     """List locally retrieved, literally quotable candidates, not conclusions.
 
     Incomplete parent blocks need a separately certified complete unit. The
     directory may describe omitted text, but callers must read it before
     citing it; candidate visibility and authorization guards still apply.
     """
+    # Historical V2/V3 inventories intentionally used the V2 quotation set.
+    # Only the new task policy may add reconciliation quotation certificates.
+    coverage_policy = (OBLIGATION_TASK_POLICY_V1 if coverage_policy == OBLIGATION_TASK_POLICY_V1
+                       else OBLIGATION_COVERAGE_POLICY_V2)
     evidence: dict[str, list[tuple[tuple, dict]]] = {key: [] for key in _OBLIGATION_LOOKUP}
     for index, source in enumerate(sources):
         text = source["text"]
         if (source.get("review_status") == "rejected"
                 or hashlib.sha256(text.encode("utf-8")).hexdigest() != source.get("text_sha256")):
             continue
-        units = _selectable_source_units(source, coverage_policy=OBLIGATION_COVERAGE_POLICY_V2)
+        units = _selectable_source_units(source, coverage_policy=coverage_policy)
         # Only boundaries already accepted by the literal quote validator are
         # candidates. Incomplete parent text never becomes generally usable.
         passages = []
@@ -1932,7 +1965,7 @@ def _obligation_evidence(sources: list[dict]) -> dict[str, list[dict]]:
                     start += 1
                 try:
                     _validate_disclosure_excerpt("公司披露：" + text[start:end], source,
-                                                 coverage_policy=OBLIGATION_COVERAGE_POLICY_V2)
+                                                 coverage_policy=coverage_policy)
                 except ValueError:
                     continue
                 passages.append((start, end))
@@ -1948,7 +1981,7 @@ def _obligation_evidence(sources: list[dict]) -> dict[str, list[dict]]:
                     continue
                 try:
                     _validate_disclosure_excerpt("公司披露：" + unit["text"], source,
-                                                 coverage_policy=OBLIGATION_COVERAGE_POLICY_V2)
+                                                 coverage_policy=coverage_policy)
                 except ValueError:
                     continue
                 relevant_units.append(unit)
@@ -1981,13 +2014,126 @@ def _obligation_label(obligation_id: str) -> str:
     return _OBLIGATION_LOOKUP.get(obligation_id, ("", obligation_id))[1]
 
 
+def _obligation_task_states(findings: list[WorkflowFinding], rounds: list[dict],
+                            sources: dict[str, dict], document_snapshot: list[dict] | None = None,
+                            prior_tasks: list[dict] | None = None) -> list[dict]:
+    """Build auditable per-obligation state from accepted findings and round records."""
+    states = []
+    local_evidence = _obligation_evidence(list(sources.values()), coverage_policy=OBLIGATION_TASK_POLICY_V1)
+    item_coverage = coverage_report(build_manifest(list(sources.values()), document_snapshot), findings)
+    for obligation_id, (topic, label) in _OBLIGATION_LOOKUP.items():
+        related = [item for item in findings if item.obligation_id == obligation_id]
+        prior = next((item for item in prior_tasks or [] if item.get("id") == obligation_id), {})
+        attempts = prior.get("attempts", 0)
+        events = deepcopy(prior.get("failure_history", []))
+        for step in rounds:
+            request = step.get("request") or {}
+            try:
+                payload = json.loads(request.get("user", "{}"))
+            except (TypeError, json.JSONDecodeError):
+                payload = {}
+            task_ids = {item.get("id") for item in payload.get("obligation_tasks", [])
+                        if isinstance(item, dict)}
+            if obligation_id not in task_ids:
+                continue
+            if step.get("status") in {"protocol_rejected", "provider_failed", "rejected"}:
+                attempts += 1
+                events.append({"round": step.get("round"), "status": (
+                    "provider_failed" if step.get("status") == "provider_failed" else "protocol_failed"),
+                               "reason": step.get("error") or step.get("protocol_feedback", {}).get("category")})
+                continue
+            dispositions = step.get("candidate_dispositions", [])
+            candidates = [item for item in dispositions
+                          if isinstance(item.get("raw_candidate"), dict)
+                          and item["raw_candidate"].get("obligation_id") == obligation_id]
+            # Evidence retrieval is a prerequisite, not an unsuccessful
+            # analysis attempt. Count submissions and explicit finish omissions.
+            if not candidates and step.get("action", {}).get("action") not in {"finish", "request_documents"}:
+                continue
+            attempts += 1
+            rejected = [item for item in candidates if item.get("status") == "rejected"]
+            if rejected:
+                errors = [error for item in rejected for error in item.get("errors", [])]
+                reason = errors[-1] if errors else "candidate_rejected"
+                failure = ("semantic_rejected" if any(item.get("semantic_issues") for item in rejected) else
+                           "local_evidence_pending" if "AGENT_LOCAL_OBLIGATION_EVIDENCE_MUST_BE_READ" in str(reason) else
+                           "source_unavailable" if "SOURCE" in str(reason) or "SOURCE_REGISTRY" in str(reason) else
+                           "protocol_failed")
+                events.append({"round": step.get("round"), "status": failure, "reason": reason})
+            elif not candidates:
+                events.append({"round": step.get("round"), "status": "model_omitted"})
+
+        source_ids = sorted({source_id for item in related for source_id in item.source_ids})
+        if any(item.evidence_kind != "evidence_insufficient" for item in related):
+            status = ("pending_review" if any(item.review_required for item in related)
+                      or any(sources.get(source_id, {}).get("review_status") != "confirmed" for source_id in source_ids)
+                      else "not_applicable" if all(item.assessment == "not_applicable" for item in related)
+                      else "completed")
+        elif related:
+            locally_readable = any(item["usable"] for item in local_evidence.get(obligation_id, []))
+            status = "local_evidence_pending" if locally_readable and all(
+                _unreferenced_obligation_insufficiency(item) for item in related
+            ) else "insufficient_evidence"
+        elif events:
+            status = events[-1]["status"]
+        else:
+            status = "unassessed"
+        pending_items = []
+        if obligation_id == "non_recurring_composition" and related and not item_coverage["complete"]:
+            pending_items = item_coverage["pending_item_ids"]
+            # One accepted line cannot close the remaining components,
+            # deductions and total. Preserve the source-bound denominator.
+            if pending_items:
+                status = "local_evidence_pending"
+            elif any(item.evidence_kind != "evidence_insufficient" for item in related):
+                status = "manifest_unresolved"
+        states.append({"id": obligation_id, "topic": topic, "label": label, "required": True,
+                       "status": status, "finding_ids": [item.id for item in related],
+                       "source_ids": source_ids, "attempts": attempts,
+                       "attempt_limit": OBLIGATION_TASK_ATTEMPT_LIMIT,
+                       "retry_allowed": status in {"unassessed", "local_evidence_pending", "protocol_failed",
+                                                   "source_unavailable", "semantic_rejected", "model_omitted",
+                                                   "provider_failed"}
+                       and attempts < OBLIGATION_TASK_ATTEMPT_LIMIT,
+                       "failure_history": events, "pending_item_ids": pending_items})
+    return states
+
+
+def _obligation_task_batch(findings: list[WorkflowFinding], rounds: list[dict],
+                           sources: dict[str, dict], document_snapshot: list[dict] | None = None,
+                           prior_tasks: list[dict] | None = None) -> list[dict]:
+    pending = [item for item in _obligation_task_states(findings, rounds, sources, document_snapshot, prior_tasks)
+               if item["retry_allowed"]]
+    return [{"id": item["id"], "topic": item["topic"], "label": item["label"],
+             "attempt": item["attempts"] + 1, "attempt_limit": item["attempt_limit"],
+             "previous_status": item["status"], "last_failure": item["failure_history"][-1]
+             if item["failure_history"] else None, "pending_item_ids": item["pending_item_ids"]}
+            for item in pending[:OBLIGATION_TASK_BATCH_LIMIT]]
+
+
+def _obligation_task_stop_reason(findings: list[WorkflowFinding], rounds: list[dict],
+                                  sources: dict[str, dict], snapshot: list[dict],
+                                  requirements: list[MaterialRequirement],
+                                  prior_tasks: list[dict] | None = None) -> str:
+    states = _obligation_task_states(findings, rounds, sources, snapshot, prior_tasks)
+    unresolved = [item for item in states if item["status"] in {
+        "unassessed", "local_evidence_pending", "protocol_failed", "provider_failed",
+        "source_unavailable", "semantic_rejected", "model_omitted", "manifest_unresolved",
+    }]
+    if unresolved:
+        return ("OBLIGATION_TASK_RETRY_EXHAUSTED" if any(
+            item["attempts"] >= item["attempt_limit"] for item in unresolved
+        ) else "OBLIGATION_TASKS_INCOMPLETE")
+    return "MATERIALS_REQUIRED" if any(item.status != "provided" for item in requirements) else "MODEL_FINISHED"
+
+
 def _mandatory_checks(findings: list[WorkflowFinding], sources: dict[str, dict], calls: list[dict],
                       requirements: list[MaterialRequirement], *, version: str = WORKFLOW_VERSION
                       , coverage_policy: str | None = None,
                       document_snapshot: list[dict] | None = None) -> list[TopicCheck]:
     checks = []
     item_coverage = (coverage_report(build_manifest(list(sources.values()), document_snapshot), findings)
-                     if coverage_policy == OBLIGATION_COVERAGE_POLICY_V3 else None)
+                     if coverage_policy in ROW_COVERAGE_POLICIES else None)
     for topic in MANDATORY_TOPICS:
         related = [item for item in findings if item.topic == topic]
         ids = sorted({source_id for item in related for source_id in item.source_ids})
@@ -2133,7 +2279,15 @@ def _agent_request(package: dict, document_snapshot: list[dict], sources: dict[s
             topic: [{"id": obligation_id, "label": label} for obligation_id, label in items]
             for topic, items in EVIDENCE_OBLIGATIONS.items()
         }
-    if progress and progress.get("obligation_policy") == OBLIGATION_COVERAGE_POLICY_V3:
+    if progress and progress.get("obligation_policy") == OBLIGATION_TASK_POLICY_V1:
+        payload["obligation_tasks"] = progress.get("obligation_task_batch", [])[:OBLIGATION_TASK_BATCH_LIMIT]
+        payload["source_registry"] = {
+            "version": "frozen_source_registry_v1",
+            "delivered_source_ids": sorted(set(progress["source_coverage"]["currently_visible_source_ids"])
+                                          | set(progress["source_coverage"]["previously_visible_source_ids"])),
+            "boundary": "已实际发送的同版本原文可跨窗口引用；服务端核对文件、页码和原文哈希。仅取得未发送、未选文件或内容变化的来源仍拒绝。",
+        }
+    if progress and progress.get("obligation_policy") in ROW_COVERAGE_POLICIES:
         payload["evidence_coverage"] = progress["evidence_coverage"]
         payload["coverage_repair"] = progress["coverage_repair"]
     if progress and progress.get("row_context_policy") in SUPPORTED_ROW_CONTEXT_POLICIES:
@@ -2234,12 +2388,66 @@ def _agent_request(package: dict, document_snapshot: list[dict], sources: dict[s
         payload["unreferenced_insufficiency_template"] = {
             "statement": INSUFFICIENCY_STATEMENT, "rationale": INSUFFICIENCY_RATIONALE,
         }
+    if progress and progress.get("obligation_policy") == OBLIGATION_TASK_POLICY_V1:
+        payload["quotation_policy"]["source_scope"] = (
+            "当前sources或source_registry.delivered_source_ids中已实际发送且同哈希的原文；"
+            "目录中从未发送过的来源必须先read_chunks。"
+        )
+        payload["obligation_response_protocol"] = {
+            "failure_boundary": "只补分配的任务；协议错误或引用失败必须修正重交，不能作为财务证据不足。",
+            "unreferenced_insufficiency": {
+                "evidence_kind": "evidence_insufficient", "assessment": "insufficient_evidence",
+                "statement": INSUFFICIENCY_STATEMENT, "rationale": INSUFFICIENCY_RATIONALE,
+                "source_ids": [], "metric_result_ids": [], "calculation_ids": [], "limitation_source_ids": [],
+            },
+            "missing_scope": "无可用专门附注时仅表示所选材料不能完成判断；material_requirements列具体章节，不声称全文未披露。",
+            "cashflow_boundary": "调节表可支持表内勾稽，不能独立支持业务因果。应收应付列报不等于回款或结算政策变化。",
+            "quotation": "company_disclosure使用observation与真实source_unit_id，statement仅填公司披露：；不手抄表格。",
+        }
+        payload = _compact_obligation_request(payload)
     return payload
+
+
+def _compact_obligation_request(payload: dict) -> dict:
+    """Avoid resending audit internals and duplicate progress in task prompts.
+
+    Full sources, accepted findings and calculations remain in the trace. All
+    visible literal text, source fingerprints, quality flags and unit ranges
+    remain in this projection; the delivery ledger therefore means the same
+    thing for live validation and offline replay.
+    """
+    value = deepcopy(payload)
+    full_hash = stable_hash(payload)
+    for source in value["sources"]:
+        box = source.pop("bounding_box", None)
+        if box is not None:
+            source["bounding_box_hash"] = stable_hash(box)
+    for units in value.get("source_units", {}).values():
+        for unit in units:
+            provenance = unit.pop("original_table_provenance", None)
+            if provenance is not None:
+                unit["provenance_hash"] = stable_hash(provenance)
+    value["accepted_findings"] = [{key: item[key] for key in (
+        "id", "topic", "obligation_id", "evidence_kind", "assessment", "source_ids",
+    ) if key in item} for item in value["accepted_findings"]]
+    progress = value["workflow_progress"]
+    for key in ("evidence_coverage", "coverage_repair", "obligation_task_batch"):
+        progress.pop(key, None)  # These remain in the top-level payload.
+    for calculation in value["local_calculations"]:
+        result = calculation.get("result")
+        if isinstance(result, dict):
+            calculation["full_result_hash"] = stable_hash(result)
+            calculation["result"] = {key: item for key, item in result.items()
+                                     if key not in {"input_ids", "input_snapshot_hash"}}
+    value["task_request_projection"] = {"version": "task_request_projection_v1",
+        "full_payload_hash": full_hash,
+        "boundary": "保留所有本轮原文及引用哈希；省略重复进度、历史候选正文和坐标细节，完整输入保存在本地审计记录。"}
+    return value
 
 
 def _agent_action_schema(version: str, progress: dict | None = None) -> dict:
     schema = _action_model(version).model_json_schema()
-    item_policy = bool(progress and progress.get("obligation_policy") == OBLIGATION_COVERAGE_POLICY_V3)
+    item_policy = bool(progress and progress.get("obligation_policy") in ROW_COVERAGE_POLICIES)
     if not item_policy:
         for definition in schema.get("$defs", {}).values():
             definition.get("properties", {}).pop("evidence_item_assessments", None)
@@ -2301,6 +2509,25 @@ def _agent_action_schema(version: str, progress: dict | None = None) -> dict:
                 "v2另可引用source_units中认证的完整complete_note；父页的其他片段仍不可引用。"
                 "已有obligation_evidence可用候选时，不得用无实质引用的通用不足模板跳过该子命题。"
             )
+        if progress and progress.get("obligation_policy") == OBLIGATION_TASK_POLICY_V1:
+            finding["source_ids"]["description"] = (
+                "引用当前sources或source_registry中已实际发送且原文哈希一致的来源；"
+                "目录中的未发送来源须先读取；每个company_disclosure只引用一个来源。"
+            )
+            assigned = [item["id"] for item in progress["obligation_task_batch"]]
+            if assigned:
+                finding["obligation_id"]["enum"] = assigned
+            else:
+                schema["properties"]["findings"]["maxItems"] = 0
+            finding["obligation_id"]["description"] = "必须是本轮obligation_tasks中分配的ID；已接纳的其他义务禁止重复生成。"
+            finding["statement"]["description"] += "无引用不足必须严格填：" + INSUFFICIENCY_STATEMENT
+            finding["rationale"]["description"] = (
+                "无引用evidence_insufficient必须严格填：" + INSUFFICIENCY_RATIONALE
+                + " 具体待补章节填material_requirements，不在此扩写未披露。其他类别仅解释所引证据。"
+            )
+            schema["$defs"][finding_name]["required"] = list(dict.fromkeys([
+                *schema["$defs"][finding_name].get("required", []), "obligation_id",
+            ]))
     if progress is not None:
         if version in {V9_WORKFLOW_VERSION, V10_WORKFLOW_VERSION, V11_WORKFLOW_VERSION}:
             finding["source_unit_id"]["description"] = (
@@ -2350,7 +2577,9 @@ def _workflow_progress(calls: list[dict], rounds: list[dict], sources: dict[str,
                        round_number: int, max_rounds: int, *, version: str = WORKFLOW_VERSION,
                        coverage_policy: str | None = None,
                        document_snapshot: list[dict] | None = None,
-                       row_context_policy: str | None = ROW_CONTEXT_POLICY_V2) -> dict:
+                       row_context_policy: str | None = ROW_CONTEXT_POLICY_V2,
+                       prior_obligation_tasks: list[dict] | None = None,
+                       prior_source_deliveries: list[dict] | None = None) -> dict:
     """Expose execution progress, never infer that a retrieval proves a claim."""
     topics = ("performance_changes", *MANDATORY_TOPICS)
     history: dict[str, list[dict]] = {topic: [] for topic in topics}
@@ -2384,6 +2613,10 @@ def _workflow_progress(calls: list[dict], rounds: list[dict], sources: dict[str,
         history.setdefault(call.get("topic") or "unassigned", []).append(entry)
         history_entries.append(entry)
     previously_visible = set()
+    if coverage_policy == OBLIGATION_TASK_POLICY_V1:
+        for delivery in prior_source_deliveries or []:
+            previously_visible.update(source_id for source_id in delivery["source_ids"]
+                if source_id in sources and sources[source_id]["text_sha256"] == delivery["source_hashes"][source_id])
     for step in rounds:
         previous_payload = json.loads(step["request"]["user"])
         previously_visible.update(item["id"] for item in previous_payload.get("sources", []))
@@ -2399,8 +2632,8 @@ def _workflow_progress(calls: list[dict], rounds: list[dict], sources: dict[str,
             and effective_calls[-1].get("name") == "read_chunks"):
         explicit_reads = [_source(chunk)["id"] for chunk in effective_calls[-1]["result"].get("chunks", [])]
     item_inventory = (coverage_report(build_manifest(list(sources.values()), document_snapshot), findings)
-                      if coverage_policy == OBLIGATION_COVERAGE_POLICY_V3 else None)
-    row_context_enabled = coverage_policy == OBLIGATION_COVERAGE_POLICY_V3 and row_context_policy in SUPPORTED_ROW_CONTEXT_POLICIES
+                      if coverage_policy in ROW_COVERAGE_POLICIES else None)
+    row_context_enabled = coverage_policy in ROW_COVERAGE_POLICIES and row_context_policy in SUPPORTED_ROW_CONTEXT_POLICIES
     pending_item_sources = list(dict.fromkeys(
         item["source_refs"][0]["source_id"] for item in item_inventory["manifest"]["items"]
         if item["id"] in item_inventory["pending_item_ids"] and item["source_refs"]
@@ -2411,7 +2644,7 @@ def _workflow_progress(calls: list[dict], rounds: list[dict], sources: dict[str,
     current_ids = visible["source_window"]["included_ids"]
     item_coverage = (coverage_report(build_manifest(list(sources.values()), document_snapshot), findings,
                                     visible_ids=current_ids, previously_sent_ids=previously_visible)
-                     if coverage_policy == OBLIGATION_COVERAGE_POLICY_V3 else None)
+                     if coverage_policy in ROW_COVERAGE_POLICIES else None)
     topic_states = {}
     for topic in topics:
         related = [item for item in findings if item.topic == topic]
@@ -2492,6 +2725,17 @@ def _workflow_progress(calls: list[dict], rounds: list[dict], sources: dict[str,
     if obligation_enabled:
         value["obligation_policy"] = coverage_policy
         value["unassessed_obligations"] = unassessed_obligations
+    if coverage_policy == OBLIGATION_TASK_POLICY_V1 and obligation_enabled:
+        task_states = _obligation_task_states(findings, rounds, sources, document_snapshot, prior_obligation_tasks)
+        task_batch = _obligation_task_batch(findings, rounds, sources, document_snapshot, prior_obligation_tasks)
+        value["obligation_task_states"] = task_states
+        value["obligation_task_batch"] = task_batch[:OBLIGATION_TASK_BATCH_LIMIT]
+        value["unassessed_obligations"] = [f"{item['topic']}:{item['id']}" for item in task_batch]
+        value["instruction"] = (
+            "仅处理obligation_task_batch列出的项目；本轮最多二十项。每个finding须对应一个id。"
+            "保留已接受finding；不得重复生成已完成或待审核的义务。失败仅记录在该义务，继续处理其他项目。"
+            "本地已有相关来源但未读时先read_chunks；取回来源后才作披露、推断或不足判断。"
+        )
     if coverage_policy in LOCAL_EVIDENCE_POLICIES:
         value["source_coverage"]["explicit_read_source_ids"] = explicit_reads
     if row_context_enabled:
@@ -2513,7 +2757,7 @@ def _workflow_progress(calls: list[dict], rounds: list[dict], sources: dict[str,
     if version in COMPLETE_UNIT_WORKFLOW_VERSIONS:
         value["source_coverage"]["topic_reservations"] = visible["source_window"].get("topic_reservations", {})
         value["instruction"] += "本地主题覆盖及未审核状态已单列；不得因窗口遗漏索要已取得的同期间披露，已有文本先分析或登记人工审核。"
-    if (row_context_policy == ROW_CONTEXT_POLICY_V2 and item_coverage is not None
+    if (coverage_policy != OBLIGATION_TASK_POLICY_V1 and row_context_policy == ROW_CONTEXT_POLICY_V2 and item_coverage is not None
             and value["coverage_repair"]["mode"] == "targeted_remaining_items"):
         value["instruction"] = (
             "本轮仅定向补分析evidence_coverage.pending_item_ids，每轮最多二十条。"
@@ -2656,7 +2900,7 @@ def _source_context(sources: list[dict], *, version: str = WORKFLOW_VERSION, syn
     characters = 0
     reservations = {}
     question_units = {source["id"]: _complete_question_units(source, version=version) for source in sources} if version in INDIVIDUAL_CANDIDATE_WORKFLOW_VERSIONS else {}
-    obligation_evidence = (_obligation_evidence(sources)
+    obligation_evidence = (_obligation_evidence(sources, coverage_policy=coverage_policy)
                           if version == V11_WORKFLOW_VERSION and coverage_policy in LOCAL_EVIDENCE_POLICIES else None)
 
     def source_characters(source: dict) -> int:
@@ -2669,7 +2913,7 @@ def _source_context(sources: list[dict], *, version: str = WORKFLOW_VERSION, syn
         # A coverage repair must carry the real row's parent source in the
         # admissible window. A generic 'no other items' topic reservation
         # cannot replace the source of a mandatory component/deduction/total.
-        if coverage_policy == OBLIGATION_COVERAGE_POLICY_V3:
+        if coverage_policy in ROW_COVERAGE_POLICIES:
             for source_id in dict.fromkeys(coverage_source_ids or []):
                 source = next((item for item in sources if item["id"] == source_id), None)
                 if (source is not None and len(selected) < SOURCE_WINDOW_BLOCKS
@@ -2765,7 +3009,7 @@ def _source_context(sources: list[dict], *, version: str = WORKFLOW_VERSION, syn
             for key, source_id in reservations.items() if key.startswith("obligation:")}
         value["source_window"]["explicit_read_reservations"] = {
             source_id: {"included": source_id in ids} for source_id in dict.fromkeys(preferred_source_ids or [])}
-        if coverage_policy == OBLIGATION_COVERAGE_POLICY_V3 and coverage_source_ids is not None:
+        if coverage_policy in ROW_COVERAGE_POLICIES and coverage_source_ids is not None:
             value["source_window"]["evidence_item_reservations"] = {
                 source_id: {"included": source_id in ids} for source_id in dict.fromkeys(coverage_source_ids or [])}
     return value
@@ -2856,7 +3100,9 @@ def _limitation_statement_options(sources: list[dict]) -> list[dict]:
 def _v7_candidate_dispositions(raw_candidates: list[object], round_number: int,
                                 sources: dict[str, dict], package: dict, calculations: list[dict],
                                 visible_ids: set[str], *, version: str = WORKFLOW_VERSION,
-                                coverage_policy: str | None = None, row_context_policy: str | None = None
+                                coverage_policy: str | None = None, row_context_policy: str | None = None,
+                                source_registry: dict | None = None,
+                                assigned_obligation_ids: set[str] | None = None
                                 ) -> tuple[list[WorkflowFinding], list[dict]]:
     """Validate raw items independently; acceptance happens only on commit."""
     findings, dispositions = [], []
@@ -2867,7 +3113,19 @@ def _v7_candidate_dispositions(raw_candidates: list[object], round_number: int,
             candidate_model = V9FindingCandidate if version in {V9_WORKFLOW_VERSION, V10_WORKFLOW_VERSION, V11_WORKFLOW_VERSION} else V7FindingCandidate
             candidate = candidate_model.model_validate(raw, strict=True)
             refs = candidate.source_ids + candidate.limitation_source_ids
-            if set(refs).intersection(sources) - visible_ids:
+            if coverage_policy == OBLIGATION_TASK_POLICY_V1:
+                if not candidate.obligation_id:
+                    raise ValueError("AGENT_OBLIGATION_ID_REQUIRED")
+                if assigned_obligation_ids is None or candidate.obligation_id not in assigned_obligation_ids:
+                    raise ValueError("AGENT_UNASSIGNED_OBLIGATION_TASK")
+                if source_registry is not None and refs:
+                    resolved = resolve_registered_sources(source_registry, refs, current_sources=sources)
+                    entry["source_resolution"] = resolved["results"]
+                    if resolved["errors"]:
+                        raise ValueError("AGENT_SOURCE_REGISTRY_RESOLUTION_FAILED:" + json_text(resolved["errors"]))
+            authorized_ids = (set(refs) if coverage_policy == OBLIGATION_TASK_POLICY_V1
+                              and source_registry is not None else visible_ids)
+            if set(refs).intersection(sources) - authorized_ids:
                 raise ValueError("AGENT_SOURCE_NOT_VISIBLE_IN_CURRENT_WINDOW")
             if len(candidate.limitation_source_ids) != len(set(candidate.limitation_source_ids)):
                 raise ValueError("AGENT_DUPLICATE_LIMITATION_REFERENCE")
@@ -2900,7 +3158,7 @@ def _v7_candidate_dispositions(raw_candidates: list[object], round_number: int,
                     raise ValueError("AGENT_UNREFERENCED_INSUFFICIENCY_REQUIRES_TEMPLATE")
             if (coverage_policy in LOCAL_EVIDENCE_POLICIES and candidate.obligation_id
                     and _unreferenced_obligation_insufficiency(candidate)):
-                available = [item for item in _obligation_evidence(list(sources.values())).get(candidate.obligation_id, [])
+                available = [item for item in _obligation_evidence(list(sources.values()), coverage_policy=coverage_policy).get(candidate.obligation_id, [])
                              if item["usable"]]
                 if available:
                     entry["local_evidence_candidates"] = available
@@ -2945,6 +3203,10 @@ def _v7_candidate_dispositions(raw_candidates: list[object], round_number: int,
                 units.extend(unit for source_id in candidate.source_ids
                              for unit in _cashflow_subtable_units_v11(sources[source_id])
                              if rendered == "公司披露：" + sources[source_id]["text"][unit["start"]:unit["end"]])
+                if coverage_policy == OBLIGATION_TASK_POLICY_V1:
+                    units.extend(unit for source_id in candidate.source_ids
+                                 for unit in reconciliation_units(sources[source_id])
+                                 if rendered == "公司披露：" + sources[source_id]["text"][unit["start"]:unit["end"]])
                 if coverage_policy in LOCAL_EVIDENCE_POLICIES:
                     units.extend(unit for source_id in candidate.source_ids
                                  for unit in _independent_note_units(sources[source_id])
@@ -2964,8 +3226,24 @@ def _v7_candidate_dispositions(raw_candidates: list[object], round_number: int,
             findings.append(checked)
         except (ValueError, ValidationError) as exc:
             entry.update(status="rejected", errors=[str(exc)])
+            if isinstance(exc, FinancialSemanticError):
+                entry["semantic_issues"] = exc.issues
         dispositions.append(entry)
     return findings, dispositions
+
+
+def _round_source_registry(sources: dict[str, dict], document_snapshot: list[dict],
+                          rounds: list[dict], prior_deliveries: list[dict] | None = None) -> dict:
+    ledger = list(prior_deliveries or [])
+    for step in rounds:
+        delivered = json.loads(step["request"]["user"]).get("sources", [])
+        ledger.append({"source_ids": [item["id"] for item in delivered],
+                       "source_hashes": {item["id"]: item["text_sha256"] for item in delivered},
+                       "source_fingerprints": {item["id"]: {key: item[key] for key in (
+                           "id", "chunk_id", "filing_version_id", "page_no", "page_sha256",
+                           "text_sha256", "source_sha256")}
+                           for item in delivered}})
+    return build_source_registry(sources, document_snapshot, sent_source_hashes=ledger)
 
 
 def _v7_action_arguments(action: V7ActionEnvelope, selected_id: int, anchor_id: int) -> dict:
@@ -3189,7 +3467,7 @@ def run_evidence_workflow(session: Session, filing: FilingVersion, package: dict
     workflow_trace["question_unit_policy"] = (V10_QUESTION_UNIT_POLICY_VERSION
                                                if WORKFLOW_VERSION in {V10_WORKFLOW_VERSION, V11_WORKFLOW_VERSION} else QUESTION_UNIT_POLICY_VERSION)
     workflow_trace["obligation_policy"] = coverage_policy
-    if coverage_policy == OBLIGATION_COVERAGE_POLICY_V3:
+    if coverage_policy in ROW_COVERAGE_POLICIES:
         workflow_trace["row_context_policy"] = ROW_CONTEXT_POLICY_V2
     last_result: object = {"status": "mandatory_searches_completed"}
     protocol_rejections = 0
@@ -3197,8 +3475,11 @@ def run_evidence_workflow(session: Session, filing: FilingVersion, package: dict
     for round_number in range(1, max_rounds + 1):
         progress = _workflow_progress(workflow_trace["tool_calls"], workflow_trace["rounds"], sources,
                                       findings, requirements, round_number, max_rounds,
-                                      coverage_policy=workflow_trace["obligation_policy"], document_snapshot=snapshot)
-        request = {"system": (ROW_CONTEXT_V2_AGENT_SYSTEM_PROMPT if coverage_policy == OBLIGATION_COVERAGE_POLICY_V3
+                                      coverage_policy=workflow_trace["obligation_policy"], document_snapshot=snapshot,
+                                      prior_obligation_tasks=(previous or {}).get("obligation_tasks"),
+                                      prior_source_deliveries=(previous or {}).get("evidence_coverage", {}).get("delivery_ledger"))
+        request = {"system": (OBLIGATION_TASK_AGENT_SYSTEM_PROMPT if coverage_policy == OBLIGATION_TASK_POLICY_V1
+                              else ROW_CONTEXT_V2_AGENT_SYSTEM_PROMPT if coverage_policy == OBLIGATION_COVERAGE_POLICY_V3
                               else OBLIGATION_V2_AGENT_SYSTEM_PROMPT if coverage_policy == OBLIGATION_COVERAGE_POLICY_V2 else AGENT_SYSTEM_PROMPT),
                    "user": json_text(_agent_request(package, snapshot, sources, calculations, findings, requirements,
                                                      last_result, round_number,
@@ -3213,10 +3494,20 @@ def run_evidence_workflow(session: Session, filing: FilingVersion, package: dict
             action_model = V10ActionEnvelope if WORKFLOW_VERSION in {V10_WORKFLOW_VERSION, V11_WORKFLOW_VERSION} else V9ActionEnvelope if WORKFLOW_VERSION == V9_WORKFLOW_VERSION else V7ActionEnvelope
             action = action_model.model_validate_json(content, strict=True)
             round_trace["action"] = action.model_dump(mode="json")
+            visible_ids = set(progress["source_coverage"]["currently_visible_source_ids"])
+            source_registry = (_round_source_registry(sources, snapshot, workflow_trace["rounds"],
+                (previous or {}).get("evidence_coverage", {}).get("delivery_ledger"))
+                               if coverage_policy == OBLIGATION_TASK_POLICY_V1 else None)
+            if source_registry is not None:
+                round_trace["source_registry_hash"] = source_registry["registry_hash"]
             added, dispositions = _v7_candidate_dispositions(
                 action.findings, round_number, sources, package, calculations,
-                set(progress["source_coverage"]["currently_visible_source_ids"]),
-                coverage_policy=coverage_policy, row_context_policy=ROW_CONTEXT_POLICY_V2,
+                visible_ids,
+                coverage_policy=coverage_policy,
+                row_context_policy=ROW_CONTEXT_POLICY_V2,
+                source_registry=source_registry,
+                assigned_obligation_ids={item["id"] for item in progress.get("obligation_task_batch", [])}
+                if coverage_policy == OBLIGATION_TASK_POLICY_V1 else None,
             )
             round_trace["candidate_dispositions"] = dispositions
             result, pending_sources, pending_calculations, pending_findings, pending_requirements = _v7_apply_action(
@@ -3250,6 +3541,15 @@ def run_evidence_workflow(session: Session, filing: FilingVersion, package: dict
                     if repair["exhausted"]:
                         stop_reason = "EVIDENCE_COVERAGE_REPAIR_EXHAUSTED"
                         break
+                if coverage_policy == OBLIGATION_TASK_POLICY_V1:
+                    remaining_tasks = _obligation_task_batch(findings, workflow_trace["rounds"], sources, snapshot,
+                                                             (previous or {}).get("obligation_tasks"))
+                    if remaining_tasks and round_number < max_rounds:
+                        continue
+                    stop_reason = _obligation_task_stop_reason(findings, workflow_trace["rounds"], sources,
+                                                               snapshot, requirements,
+                                                               (previous or {}).get("obligation_tasks"))
+                    break
                 if rejected and round_number < max_rounds:
                     continue
                 stop_reason = ("CANDIDATE_REJECTIONS_RETAINED" if _v7_has_rejections(
@@ -3285,9 +3585,14 @@ def run_evidence_workflow(session: Session, filing: FilingVersion, package: dict
             if save_checkpoint is not None:
                 save_checkpoint()
     # Each required topic remains visible even when the model omitted it.
-    if stop_reason == "ROUND_BUDGET_REACHED" and _v7_has_rejections(workflow_trace["rounds"]):
+    if (coverage_policy != OBLIGATION_TASK_POLICY_V1 and stop_reason == "ROUND_BUDGET_REACHED"
+            and _v7_has_rejections(workflow_trace["rounds"])):
         stop_reason = "CANDIDATE_REJECTIONS_RETAINED"
-    if _obligation_enabled(version=WORKFLOW_VERSION, coverage_policy=workflow_trace["obligation_policy"]):
+    task_states = (_obligation_task_states(findings, workflow_trace["rounds"], sources, snapshot,
+                                           (previous or {}).get("obligation_tasks"))
+                   if coverage_policy == OBLIGATION_TASK_POLICY_V1 else None)
+    if (_obligation_enabled(version=WORKFLOW_VERSION, coverage_policy=workflow_trace["obligation_policy"])
+            and coverage_policy != OBLIGATION_TASK_POLICY_V1):
         for topic in MANDATORY_TOPICS:
             for obligation_id, label in _obligation_items(topic):
                 if any(item.obligation_id == obligation_id for item in findings):
@@ -3298,7 +3603,7 @@ def run_evidence_workflow(session: Session, filing: FilingVersion, package: dict
                            "rationale": "必查检索已执行，但模型未提交通过引用校验的该子命题结论；主题内其他子命题不能替代本项，也不能据此判断企业没有相关信号。"}
                 findings.append(_validate_finding(FindingCandidate(**payload), sources, package, calculations,
                                                    coverage_policy=coverage_policy))
-    else:
+    elif coverage_policy != OBLIGATION_TASK_POLICY_V1:
         for topic in MANDATORY_TOPICS:
             if not any(item.topic == topic for item in findings):
                 payload = {"topic": topic, "evidence_kind": "evidence_insufficient",
@@ -3315,6 +3620,10 @@ def run_evidence_workflow(session: Session, filing: FilingVersion, package: dict
         or any(item.status == "needs_review" for item in requirements) else "completed")
     if stop_reason not in {"MODEL_FINISHED", "MATERIALS_REQUIRED"}:
         status = "partial_result"
+    if status == "completed" and task_states and any(
+        item["status"] not in {"completed", "not_applicable"} for item in task_states
+    ):
+        status = "partial_result"
     checkpoint = _checkpoint_state(WORKFLOW_VERSION, stable_hash(snapshot), sources,
                                    findings, requirements, calculations)
     result = AgentWorkflowResult(version=WORKFLOW_VERSION, status=status, stop_reason=stop_reason,
@@ -3322,8 +3631,9 @@ def run_evidence_workflow(session: Session, filing: FilingVersion, package: dict
         calculations=calculations, findings=findings, mandatory_checks=checks, material_requirements=requirements,
         completed_rounds=len(workflow_trace["rounds"]), checkpoint_id=stable_hash(checkpoint),
         resumed_from_checkpoint=previous.get("checkpoint_id") if previous else None,
-        limitations=WORKFLOW_LIMITATIONS, coverage_policy=workflow_trace["obligation_policy"]).model_dump(mode="json")
-    if coverage_policy == OBLIGATION_COVERAGE_POLICY_V3:
+        limitations=WORKFLOW_LIMITATIONS, coverage_policy=workflow_trace["obligation_policy"],
+        obligation_tasks=task_states).model_dump(mode="json")
+    if coverage_policy in ROW_COVERAGE_POLICIES:
         result["evidence_coverage"] = _final_coverage_report(sources, findings, snapshot,
                                                            rounds=workflow_trace["rounds"], previous=previous,
                                                            row_context_policy=ROW_CONTEXT_POLICY_V2)
@@ -3340,6 +3650,19 @@ def validate_workflow_result(value: dict, package: dict) -> None:
         raise ValueError("AGENT_WORKFLOW_VERSION_MISMATCH")
     if result.coverage_policy is not None and result.coverage_policy not in SUPPORTED_OBLIGATION_POLICIES:
         raise ValueError("AGENT_COVERAGE_POLICY_MISMATCH")
+    if result.coverage_policy == OBLIGATION_TASK_POLICY_V1:
+        expected_ids = set(_OBLIGATION_LOOKUP)
+        tasks = value.get("obligation_tasks")
+        if (not isinstance(tasks, list) or len(tasks) != len(expected_ids)
+                or any(not isinstance(item, dict) for item in tasks)
+                or {item.get("id") for item in tasks} != expected_ids
+                or any(item.get("status") not in {"unassessed", "local_evidence_pending", "protocol_failed",
+                    "source_unavailable", "semantic_rejected", "model_omitted", "insufficient_evidence",
+                    "pending_review", "completed", "not_applicable", "manifest_unresolved",
+                    "provider_failed"} for item in tasks)):
+            raise ValueError("AGENT_OBLIGATION_TASK_STATE_INVALID")
+    elif "obligation_tasks" in value:
+        raise ValueError("AGENT_OBLIGATION_TASK_POLICY_REQUIRED")
     if result.coverage_policy in SUPPORTED_OBLIGATION_POLICIES and result.version != WORKFLOW_VERSION:
         raise ValueError("AGENT_COVERAGE_POLICY_VERSION_MISMATCH")
     if result.document_snapshot_hash != stable_hash(result.document_snapshot):
@@ -3370,6 +3693,23 @@ def validate_workflow_result(value: dict, package: dict) -> None:
                 or source["id"] in sources):
             raise ValueError("AGENT_SOURCE_SNAPSHOT_MISMATCH")
         sources[source["id"]] = source
+    if result.coverage_policy == OBLIGATION_TASK_POLICY_V1:
+        derived = {item["id"]: item for item in _obligation_task_states(
+            list(result.findings), [], sources, result.document_snapshot)}
+        for task in result.obligation_tasks:
+            expected_task = derived[task["id"]]
+            if (task.get("finding_ids") != expected_task["finding_ids"]
+                    or task.get("source_ids") != expected_task["source_ids"]
+                    or task.get("required") is not True
+                    or type(task.get("attempts")) is not int or task["attempts"] < 0
+                    or task.get("attempt_limit") != OBLIGATION_TASK_ATTEMPT_LIMIT
+                    or (task["status"] in {"completed", "not_applicable", "pending_review", "insufficient_evidence"}
+                        and task["status"] != expected_task["status"])):
+                raise ValueError("AGENT_OBLIGATION_TASK_STATE_MISMATCH")
+        if result.status == "completed" and any(
+            task["status"] not in {"completed", "not_applicable"} for task in result.obligation_tasks
+        ):
+            raise ValueError("AGENT_OBLIGATION_TASK_COMPLETION_MISMATCH")
     for calculation in result.calculations:
         unhashed = {key: item for key, item in calculation.items() if key != "id"}
         if calculation["id"] != "calc-" + stable_hash(unhashed)[:24]:
@@ -3473,7 +3813,7 @@ def validate_workflow_result(value: dict, package: dict) -> None:
                       for check in result.mandatory_checks for query in check.searched_queries]
     expected_checks = _mandatory_checks(list(result.findings), sources, expected_calls, expected_requirements,
                                         version=result.version, coverage_policy=result.coverage_policy, document_snapshot=result.document_snapshot)
-    if result.coverage_policy == OBLIGATION_COVERAGE_POLICY_V3:
+    if result.coverage_policy in ROW_COVERAGE_POLICIES:
         expected_coverage = _final_coverage_report(sources, list(result.findings), result.document_snapshot,
             delivery_ledger=(result.evidence_coverage or {}).get("delivery_ledger"),
             row_context_policy=(result.evidence_coverage or {}).get("item_assessment_policy"))
@@ -3492,6 +3832,9 @@ def validate_workflow_result(value: dict, package: dict) -> None:
         else "completed"
     )
     if result.version in INDIVIDUAL_CANDIDATE_WORKFLOW_VERSIONS and result.stop_reason not in {"MODEL_FINISHED", "MATERIALS_REQUIRED"}:
+        expected_status = "partial_result"
+    if (result.coverage_policy == OBLIGATION_TASK_POLICY_V1 and expected_status == "completed"
+            and any(item["status"] not in {"completed", "not_applicable"} for item in result.obligation_tasks)):
         expected_status = "partial_result"
     if result.status != expected_status:
         raise ValueError("AGENT_STATUS_STATE_MISMATCH")
@@ -3513,7 +3856,7 @@ def replay_evidence_workflow(trace: dict, package: dict, check_provider=None) ->
     coverage_policy = agent.get("obligation_policy")
     row_context_policy = agent.get("row_context_policy")
     if row_context_policy is not None and (
-        row_context_policy not in SUPPORTED_ROW_CONTEXT_POLICIES or coverage_policy != OBLIGATION_COVERAGE_POLICY_V3
+        row_context_policy not in SUPPORTED_ROW_CONTEXT_POLICIES or coverage_policy not in ROW_COVERAGE_POLICIES
     ):
         raise ValueError("REPLAY_AGENT_ROW_CONTEXT_POLICY_MISMATCH")
     if coverage_policy is not None and (
@@ -3586,10 +3929,12 @@ def replay_evidence_workflow(trace: dict, package: dict, check_provider=None) ->
     previous_trace = trace.get("previous_execution", {}).get("tool_trace")
     previous_agent = previous_trace.get("agent") if isinstance(previous_trace, dict) else None
     if previous_trace is not None and previous_agent and previous_agent.get("status") != "unavailable":
-        previous_package = previous_trace.get("evidence_package")
+        report_previous = (coverage_policy == OBLIGATION_TASK_POLICY_V1
+                           and previous_trace.get("version") == "report-evidence-analysis-v1")
+        previous_package = previous_trace.get("input_snapshot" if report_previous else "evidence_package")
         if not isinstance(previous_package, dict):
             raise TypeError("REPLAY_PREVIOUS_EVIDENCE_PACKAGE_MISSING")
-        if stable_hash(previous_package) != previous_trace.get("input_hash"):
+        if stable_hash(previous_package) != previous_trace.get("input_snapshot_hash" if report_previous else "input_hash"):
             raise ValueError("REPLAY_PREVIOUS_INPUT_SNAPSHOT_MISMATCH")
         if stable_hash(previous_trace) != trace["previous_execution"].get("tool_trace_hash"):
             raise ValueError("REPLAY_PREVIOUS_TRACE_HASH_MISMATCH")
@@ -3669,6 +4014,7 @@ def replay_evidence_workflow(trace: dict, package: dict, check_provider=None) ->
                          else V9_AGENT_SYSTEM_PROMPT if agent["version"] == V9_WORKFLOW_VERSION
                          else V10_AGENT_SYSTEM_PROMPT if agent["version"] == V10_WORKFLOW_VERSION
                          else LEGACY_V11_AGENT_SYSTEM_PROMPT if legacy_v11
+                         else OBLIGATION_TASK_AGENT_SYSTEM_PROMPT if coverage_policy == OBLIGATION_TASK_POLICY_V1
                          else ROW_CONTEXT_V2_AGENT_SYSTEM_PROMPT if row_context_policy == ROW_CONTEXT_POLICY_V2
                          else ROW_CONTEXT_AGENT_SYSTEM_PROMPT if row_context_policy == ROW_CONTEXT_POLICY_VERSION
                          else OBLIGATION_V3_AGENT_SYSTEM_PROMPT if coverage_policy == OBLIGATION_COVERAGE_POLICY_V3
@@ -3678,7 +4024,9 @@ def replay_evidence_workflow(trace: dict, package: dict, check_provider=None) ->
         progress = (_workflow_progress(tools[:tool_index], rounds[:index - 1], sources, findings,
                                        requirements, index, agent["max_rounds"],
                                        version=agent["version"], coverage_policy=coverage_policy, document_snapshot=snapshot,
-                                       row_context_policy=row_context_policy) if progress_policy else None)
+                                       row_context_policy=row_context_policy,
+                                       prior_obligation_tasks=(previous_result or {}).get("obligation_tasks"),
+                                       prior_source_deliveries=(previous_result or {}).get("evidence_coverage", {}).get("delivery_ledger")) if progress_policy else None)
         action_schema = _agent_action_schema(agent["version"], progress)
         if (step.get("round") != index or not isinstance(request, dict)
                 or request.get("system") != system_prompt
@@ -3754,10 +4102,20 @@ def replay_evidence_workflow(trace: dict, package: dict, check_provider=None) ->
         if action.model_dump(mode="json") != step.get("action"):
             raise ValueError("REPLAY_AGENT_ACTION_MISMATCH")
         if agent["version"] in INDIVIDUAL_CANDIDATE_WORKFLOW_VERSIONS:
+            visible_ids = set(progress["source_coverage"]["currently_visible_source_ids"])
+            source_registry = (_round_source_registry(sources, snapshot, rounds[:index],
+                (previous_result or {}).get("evidence_coverage", {}).get("delivery_ledger"))
+                               if coverage_policy == OBLIGATION_TASK_POLICY_V1 else None)
+            if source_registry is not None and step.get("source_registry_hash") != source_registry["registry_hash"]:
+                raise ValueError("REPLAY_AGENT_SOURCE_REGISTRY_MISMATCH")
             added, dispositions = _v7_candidate_dispositions(
                 action.findings, index, sources, package, calculations,
-                set(progress["source_coverage"]["currently_visible_source_ids"]), version=agent["version"],
-                coverage_policy=coverage_policy, row_context_policy=row_context_policy,
+                visible_ids, version=agent["version"],
+                coverage_policy=coverage_policy,
+                row_context_policy=row_context_policy,
+                source_registry=source_registry,
+                assigned_obligation_ids={item["id"] for item in progress.get("obligation_task_batch", [])}
+                if coverage_policy == OBLIGATION_TASK_POLICY_V1 else None,
             )
 
             def replay_tool(name: str, arguments: dict, topic: str | None, expected: dict | None) -> dict:
@@ -3807,6 +4165,17 @@ def replay_evidence_workflow(trace: dict, package: dict, check_provider=None) ->
                         if index != len(rounds):
                             raise ValueError("REPLAY_AGENT_FINISHED_ROUND_COUNT_MISMATCH")
                         break
+                if coverage_policy == OBLIGATION_TASK_POLICY_V1:
+                    remaining_tasks = _obligation_task_batch(findings, rounds[:index], sources, snapshot,
+                                                             (previous_result or {}).get("obligation_tasks"))
+                    if remaining_tasks and index < agent["max_rounds"]:
+                        continue
+                    stop_reason = _obligation_task_stop_reason(findings, rounds[:index], sources,
+                                                               snapshot, requirements,
+                                                               (previous_result or {}).get("obligation_tasks"))
+                    if index != len(rounds):
+                        raise ValueError("REPLAY_AGENT_FINISHED_ROUND_COUNT_MISMATCH")
+                    break
                 if rejected and index < agent["max_rounds"]:
                     continue
                 stop_reason = ("CANDIDATE_REJECTIONS_RETAINED" if _v7_has_rejections(
@@ -3917,9 +4286,14 @@ def replay_evidence_workflow(trace: dict, package: dict, check_provider=None) ->
 
     if tool_index != len(tools):
         raise ValueError("REPLAY_AGENT_TOOL_SEQUENCE_MISMATCH")
-    if agent["version"] in INDIVIDUAL_CANDIDATE_WORKFLOW_VERSIONS and stop_reason == "ROUND_BUDGET_REACHED" and _v7_has_rejections(rounds):
+    if (coverage_policy != OBLIGATION_TASK_POLICY_V1 and agent["version"] in INDIVIDUAL_CANDIDATE_WORKFLOW_VERSIONS
+            and stop_reason == "ROUND_BUDGET_REACHED" and _v7_has_rejections(rounds)):
         stop_reason = "CANDIDATE_REJECTIONS_RETAINED"
-    if _obligation_enabled(version=agent["version"], coverage_policy=coverage_policy):
+    task_states = (_obligation_task_states(findings, rounds, sources, snapshot,
+                                           (previous_result or {}).get("obligation_tasks"))
+                   if coverage_policy == OBLIGATION_TASK_POLICY_V1 else None)
+    if (_obligation_enabled(version=agent["version"], coverage_policy=coverage_policy)
+            and coverage_policy != OBLIGATION_TASK_POLICY_V1):
         for topic in MANDATORY_TOPICS:
             for obligation_id, label in _obligation_items(topic):
                 if any(item.obligation_id == obligation_id for item in findings):
@@ -3930,7 +4304,7 @@ def replay_evidence_workflow(trace: dict, package: dict, check_provider=None) ->
                            "rationale": "必查检索已执行，但模型未提交通过引用校验的该子命题结论；主题内其他子命题不能替代本项，也不能据此判断企业没有相关信号。"}
                 findings.append(_validate_finding(FindingCandidate(**payload), sources, package, calculations,
                                                   version=agent["version"]))
-    else:
+    elif coverage_policy != OBLIGATION_TASK_POLICY_V1:
         for topic in MANDATORY_TOPICS:
             if not any(item.topic == topic for item in findings):
                 payload = {"topic": topic, "evidence_kind": "evidence_insufficient",
@@ -3947,6 +4321,10 @@ def replay_evidence_workflow(trace: dict, package: dict, check_provider=None) ->
         or any(item.status == "needs_review" for item in requirements) else "completed")
     if agent["version"] in INDIVIDUAL_CANDIDATE_WORKFLOW_VERSIONS and stop_reason not in {"MODEL_FINISHED", "MATERIALS_REQUIRED"}:
         status = "partial_result"
+    if status == "completed" and task_states and any(
+        item["status"] not in {"completed", "not_applicable"} for item in task_states
+    ):
+        status = "partial_result"
     checkpoint = _checkpoint_state(agent["version"], stable_hash(snapshot), sources,
                                    findings, requirements, calculations)
     reconstructed = _serialized_workflow_result(
@@ -3955,10 +4333,11 @@ def replay_evidence_workflow(trace: dict, package: dict, check_provider=None) ->
             calculations=calculations, findings=findings, mandatory_checks=checks, material_requirements=requirements,
             completed_rounds=len(rounds), checkpoint_id=stable_hash(checkpoint),
             resumed_from_checkpoint=previous_result.get("checkpoint_id") if previous_result else None,
-            limitations=WORKFLOW_LIMITATIONS, coverage_policy=coverage_policy),
+            limitations=WORKFLOW_LIMITATIONS, coverage_policy=coverage_policy,
+            obligation_tasks=task_states),
         version=agent["version"],
     )
-    if coverage_policy == OBLIGATION_COVERAGE_POLICY_V3:
+    if coverage_policy in ROW_COVERAGE_POLICIES:
         reconstructed["evidence_coverage"] = _final_coverage_report(sources, findings, snapshot,
                                                                   rounds=rounds, previous=previous_result,
                                                                   row_context_policy=row_context_policy)
