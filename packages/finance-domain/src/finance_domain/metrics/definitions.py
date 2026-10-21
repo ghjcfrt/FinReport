@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from decimal import Decimal, localcontext
+from decimal import Decimal, DecimalException, localcontext
 
+from finance_domain.decimal_policy import financial_context
 from finance_domain.metrics.formulas import free_cash_flow
 
 
@@ -52,61 +53,65 @@ class MetricFormula:
 
     def evaluate(self, values: dict[str, Decimal]) -> Decimal:
         inputs = [values[code] for code in self.input_keys]
+        if any(not isinstance(value, Decimal) for value in inputs):
+            raise ValueError("INVALID_METRIC_INPUT")
         if any(not value.is_finite() for value in inputs):
             raise ValueError("NON_FINITE_METRIC_INPUT")
-        with localcontext() as context:
-            context.prec = 48
-            if self.operation == "identity":
-                return inputs[0]
-            if self.operation == "difference":
-                return inputs[0] - inputs[1]
-            if self.operation in {"ebit_expensed_interest_proxy", "expensed_interest_coverage_proxy"}:
-                profit, interest = inputs
-                if interest < 0:
-                    raise ValueError("NEGATIVE_INTEREST_EXPENSE")
-                if self.operation == "expensed_interest_coverage_proxy":
-                    if interest <= 0:
-                        raise ValueError("NON_POSITIVE_INTEREST_EXPENSE")
-                    return (profit + interest) / interest
-                return profit + interest
-            if self.operation == "net_debt_cash_proxy":
-                if any(value < 0 for value in inputs):
-                    raise ValueError("NEGATIVE_BALANCE_INPUT")
-                return sum(inputs[:-1], Decimal(0)) - inputs[-1]
-            if self.operation == "free_cash_flow":
-                value, issue = free_cash_flow(inputs[0], inputs[1])
-                if issue:
-                    raise ValueError(issue)
-                return value
-            if self.operation == "gross_margin":
-                if inputs[0] <= 0:
-                    raise ValueError("NON_POSITIVE_REVENUE")
-                if inputs[1] < 0:
-                    raise ValueError("NEGATIVE_OPERATING_COST")
-                return (inputs[0] - inputs[1]) / inputs[0]
-            if self.operation == "quick_ratio_proxy":
-                assets, inventories, liabilities = inputs
-                if min(assets, inventories) < 0 or assets < inventories:
-                    raise ValueError("INVALID_QUICK_ASSET_PROXY_INPUT")
-                if liabilities <= 0:
-                    raise ValueError("NON_POSITIVE_DENOMINATOR")
-                return (assets - inventories) / liabilities
-            if self.operation in {"average_balance_ratio", "average_balance_turnover"}:
-                numerator, closing, opening = inputs
-                if min(closing, opening) < 0:
-                    raise ValueError("NEGATIVE_BALANCE_INPUT")
-                denominator = (closing + opening) / 2
-                if denominator <= 0:
-                    raise ValueError("NON_POSITIVE_DENOMINATOR")
-                if self.operation == "average_balance_turnover" and numerator < 0:
-                    raise ValueError("NEGATIVE_TURNOVER_FLOW")
-                return numerator / denominator
-            if self.operation in {"ratio", "nonnegative_ratio"}:
-                if inputs[1] <= 0:
-                    raise ValueError("NON_POSITIVE_DENOMINATOR")
-                if self.operation == "nonnegative_ratio" and inputs[0] < 0:
-                    raise ValueError("NEGATIVE_BALANCE_INPUT")
-                return inputs[0] / inputs[1]
+        try:
+            with localcontext(financial_context()):
+                if self.operation == "identity":
+                    return inputs[0]
+                if self.operation == "difference":
+                    return inputs[0] - inputs[1]
+                if self.operation in {"ebit_expensed_interest_proxy", "expensed_interest_coverage_proxy"}:
+                    profit, interest = inputs
+                    if interest < 0:
+                        raise ValueError("NEGATIVE_INTEREST_EXPENSE")
+                    if self.operation == "expensed_interest_coverage_proxy":
+                        if interest <= 0:
+                            raise ValueError("NON_POSITIVE_INTEREST_EXPENSE")
+                        return (profit + interest) / interest
+                    return profit + interest
+                if self.operation == "net_debt_cash_proxy":
+                    if any(value < 0 for value in inputs):
+                        raise ValueError("NEGATIVE_BALANCE_INPUT")
+                    return sum(inputs[:-1], Decimal(0)) - inputs[-1]
+                if self.operation == "free_cash_flow":
+                    value, issue = free_cash_flow(inputs[0], inputs[1])
+                    if issue:
+                        raise ValueError(issue)
+                    return value
+                if self.operation == "gross_margin":
+                    if inputs[0] <= 0:
+                        raise ValueError("NON_POSITIVE_REVENUE")
+                    if inputs[1] < 0:
+                        raise ValueError("NEGATIVE_OPERATING_COST")
+                    return (inputs[0] - inputs[1]) / inputs[0]
+                if self.operation == "quick_ratio_proxy":
+                    assets, inventories, liabilities = inputs
+                    if min(assets, inventories) < 0 or assets < inventories:
+                        raise ValueError("INVALID_QUICK_ASSET_PROXY_INPUT")
+                    if liabilities <= 0:
+                        raise ValueError("NON_POSITIVE_DENOMINATOR")
+                    return (assets - inventories) / liabilities
+                if self.operation in {"average_balance_ratio", "average_balance_turnover"}:
+                    numerator, closing, opening = inputs
+                    if min(closing, opening) < 0:
+                        raise ValueError("NEGATIVE_BALANCE_INPUT")
+                    denominator = (closing + opening) / 2
+                    if denominator <= 0:
+                        raise ValueError("NON_POSITIVE_DENOMINATOR")
+                    if self.operation == "average_balance_turnover" and numerator < 0:
+                        raise ValueError("NEGATIVE_TURNOVER_FLOW")
+                    return numerator / denominator
+                if self.operation in {"ratio", "nonnegative_ratio"}:
+                    if inputs[1] <= 0:
+                        raise ValueError("NON_POSITIVE_DENOMINATOR")
+                    if self.operation == "nonnegative_ratio" and inputs[0] < 0:
+                        raise ValueError("NEGATIVE_BALANCE_INPUT")
+                    return inputs[0] / inputs[1]
+        except DecimalException as exc:
+            raise ValueError("METRIC_ARITHMETIC_OUT_OF_RANGE") from exc
         raise ValueError("UNKNOWN_METRIC_OPERATION")
 
 

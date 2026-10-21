@@ -8,6 +8,7 @@ from collections import defaultdict
 from datetime import date
 from decimal import Decimal, localcontext
 
+from finance_domain.decimal_policy import financial_context
 from finance_domain.filings.concepts import validate_concept_metadata
 from finance_domain.metrics.definitions import (
     METRIC_DEFINITIONS,
@@ -42,8 +43,7 @@ def _related_records(session: Session, model, fact_ids: list[int], *ordering) ->
 
 
 def _snapshot_record(fact: FinancialFact, evidence, dimensions) -> dict:
-    with localcontext() as context:
-        context.prec = 48
+    with localcontext(financial_context()):
         normalized_value = str(Decimal(fact.value).quantize(Decimal("0.0001")))
     return {
         "id": fact.id,
@@ -61,6 +61,11 @@ def _snapshot_record(fact: FinancialFact, evidence, dimensions) -> dict:
 
 
 def _review_digest(fact: FinancialFact, evidence, dimensions) -> str:
+    with localcontext(financial_context()):
+        evidence_metadata = [{"id": item.id, "table": item.table_name,
+                              "raw_label": item.raw_label, "extractor": item.extractor,
+                              "confidence": str(Decimal(item.confidence).quantize(Decimal("0.0001")))}
+                             for item in evidence]
     payload = {
         "version": "fact-review-evidence-v1",
         "snapshot": _snapshot_record(fact, evidence, dimensions),
@@ -71,10 +76,7 @@ def _review_digest(fact: FinancialFact, evidence, dimensions) -> str:
         "raw_value": fact.raw_value,
         "comparative_period": fact.comparative_period,
         "is_restatement": fact.is_restatement,
-        "evidence_metadata": [{"id": item.id, "table": item.table_name,
-                               "raw_label": item.raw_label, "extractor": item.extractor,
-                               "confidence": str(Decimal(item.confidence).quantize(Decimal("0.0001")))}
-                              for item in evidence],
+        "evidence_metadata": evidence_metadata,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
@@ -135,6 +137,13 @@ def require_source_assurance(session: Session, filing: FilingVersion) -> None:
 
 def current_verified_facts(session: Session, filing: FilingVersion) -> dict[str, FinancialFact]:
     require_supported_period(filing)
+    from finance_adapters.persistence.auto_validation_gateway import (
+        auto_validated_facts,
+        uses_automatic_policy,
+    )
+    if uses_automatic_policy(filing):
+        require_source_assurance(session, filing)
+        return auto_validated_facts(session, filing)
     facts: dict[str, FinancialFact] = {}
     candidates = list(session.scalars(select(FinancialFact).where(
         FinancialFact.filing_version_id == filing.id,
@@ -189,18 +198,39 @@ def _snapshot(facts: dict[str, FinancialFact]) -> str:
         evidence, dimensions = related[session] if session else ({}, {})
         value.append(_snapshot_record(fact, evidence.get(fact.id, []), dimensions.get(fact.id, [])))
     classifications = []
+    filing_policies = {}
     for session, ids in sessions.items():
         filing_ids = {fact.filing_version_id for fact in facts.values() if object_session(fact) is session}
         rows = session.execute(select(
             FilingVersion.id, FilingVersion.company_id, Company.industry_code,
-            Company.industry_taxonomy_version,
+            Company.industry_taxonomy_version, FilingVersion.fact_validation_policy,
         ).outerjoin(Company, FilingVersion.company_id == Company.id)
           .where(FilingVersion.id.in_(filing_ids)))
-        for filing_id, company_id, industry_code, taxonomy in rows:
+        for filing_id, company_id, industry_code, taxonomy, policy in rows:
+            filing_policies[filing_id] = policy or "legacy_manual_v1"
             classifications.append({"filing_id": filing_id, "company_id": company_id,
                                     "industry_code": industry_code,
                                     "industry_taxonomy_version": taxonomy})
     payload = {"facts": value, "classification": sorted(classifications, key=lambda row: row["filing_id"])}
+    # Preserve legacy snapshot bytes; automatic inputs bind their versioned
+    # source certificate as well as the existing financial snapshot.
+    from finance_adapters.persistence.models import FactAutoValidationRun
+    from finance_adapters.providers.fact_auto_validation import POLICY_VERSION
+    certificates = []
+    for session, ids in sessions.items():
+        filing_ids = {fact.filing_version_id for fact in facts.values() if object_session(fact) is session}
+        for filing_id in filing_ids:
+            if filing_policies.get(filing_id, "legacy_manual_v1") != POLICY_VERSION:
+                continue
+            certificate = session.scalar(select(FactAutoValidationRun).where(
+                FactAutoValidationRun.filing_version_id == filing_id,
+            ).order_by(FactAutoValidationRun.id.desc()).limit(1))
+            if certificate is None:
+                raise ValueError("AUTO_FACT_RECEIPT_REQUIRED")
+            certificates.append({"filing_id": filing_id, "policy": certificate.policy_version,
+                                 "input": certificate.input_snapshot_hash, "output": certificate.output_hash})
+    if certificates:
+        payload["automatic_admission"] = sorted(certificates, key=lambda row: row["filing_id"])
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
@@ -217,6 +247,20 @@ def verified_comparative_facts(
     session: Session, filing: FilingVersion,
 ) -> tuple[dict[str, FinancialFact], list[int]]:
     """Admit same-report prior columns with the same evidence/review gate as comparison."""
+    from finance_adapters.persistence.auto_validation_gateway import (
+        auto_validated_facts,
+        uses_automatic_policy,
+    )
+    if uses_automatic_policy(filing):
+        require_source_assurance(session, filing)
+        verified = auto_validated_facts(session, filing, comparative=True)
+        admitted_ids = {fact.id for fact in verified.values()}
+        excluded = [fact.id for fact in session.scalars(select(FinancialFact).where(
+            FinancialFact.filing_version_id == filing.id,
+            FinancialFact.comparative_period.is_(True),
+            FinancialFact.review_status != "superseded", FinancialFact.quality_status != "superseded",
+        ).order_by(FinancialFact.id)) if fact.id not in admitted_ids]
+        return verified, excluded
     from finance_adapters.persistence.review_gateway import _comparative_metadata_matches
 
     prior, excluded, seen = {}, [], set()

@@ -107,6 +107,9 @@ class AgentWorkflowResult(BaseModel):
     coverage_policy: str | None = None
     evidence_coverage: dict | None = None
     obligation_tasks: list[dict] | None = None
+    # Frozen only for new runs.  Absence keeps historical replay semantics.
+    semantic_policy: str | None = None
+    source_unit_admission_policy: str | None = None
 
     @model_serializer(mode="wrap")
     def _serialize_optional_coverage(self, handler):
@@ -115,4 +118,8 @@ class AgentWorkflowResult(BaseModel):
             value.pop("evidence_coverage", None)
         if value.get("obligation_tasks") is None:
             value.pop("obligation_tasks", None)
+        if value.get("semantic_policy") is None:
+            value.pop("semantic_policy", None)
+        if value.get("source_unit_admission_policy") is None:
+            value.pop("source_unit_admission_policy", None)
         return value

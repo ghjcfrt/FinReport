@@ -50,6 +50,9 @@ def comparative_candidates(extractor: StatementExtractor, target_year: int) -> l
         matches = [row for row in table.rows
                    if normalized_label(row.raw_label) == normalized_label(current.raw_label)
                    and len(row.cells) > max(current_column, prior_column)
+                   and len(row.column_bboxes) > prior_column
+                   and len(row.value_bboxes) > prior_column
+                   and row.value_bboxes[prior_column] is not None
                    and parse_number(row.cells[current_column]) == current.value]
         if len(matches) != 1:
             continue
@@ -64,7 +67,8 @@ def comparative_candidates(extractor: StatementExtractor, target_year: int) -> l
             "period_end": date(target_year - 1, 12, 31),
             "is_restatement": "重述" in header or "重列" in header,
             "column_role": table.column_roles[prior_column],
-            "row_bbox": list(row.row_bbox),
+            "row_bbox": list(row.column_bboxes[prior_column]),
+            "value_bbox": list(row.value_bboxes[prior_column]),
         })
     return results
 
@@ -116,6 +120,7 @@ def persist_comparative_candidates(
             column_locator=candidate["column_label"], raw_value=candidate["raw_value"],
             bounding_box={
                 "source": "text-layer", "row": candidate["row_bbox"],
+                "value": candidate["value_bbox"],
                 "extraction_job_id": job_id, "scope": filing.scope,
                 "unit_scale": current.unit_scale, "unit_page_no": current.unit_page_no,
                 "unit_text": current.unit_text, "value_basis": "normalized_currency",

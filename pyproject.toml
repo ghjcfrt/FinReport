@@ -38,6 +38,18 @@ worker = [
     "celery>=5.4.0",
     "redis>=5.2.0",
 ]
+output-validation = [
+    "guardrails-ai==0.11.0; python_version < '3.14'",
+]
+structured-output = [
+    "outlines[openai]==1.3.3",
+]
+semantic = [
+    "semantica==0.7.0; python_version < '3.14'",
+]
+evaluation = [
+    "dspy==3.4.1; python_version < '3.16'",
+]
 
 [tool.pytest.ini_options]
 pythonpath = [

@@ -40,13 +40,18 @@ def _filing(session: Session, filing_id: int) -> FilingVersion:
 def resume_analysis(request: Request, analysis_run_id: int, background: BackgroundTasks,
                     session: Session = Depends(get_session)):
     """Keep the checkpoint and admit newly supplied documents on the next round."""
-    from finance_adapters.providers.llm_analysis import build_evidence_package
+    from finance_adapters.providers.llm_analysis import (
+        STRICT_ANALYSIS_ORCHESTRATION_VERSIONS,
+        build_evidence_package,
+    )
 
     from finreport_api.routes import workflow_runtime
 
     run = session.get(AnalysisRun, analysis_run_id)
     if run is None:
         raise HTTPException(404, "ANALYSIS_NOT_FOUND")
+    if getattr(run, "orchestration_version", None) not in STRICT_ANALYSIS_ORCHESTRATION_VERSIONS:
+        raise HTTPException(409, "ANALYSIS_WORKFLOW_TYPE_MISMATCH")
     if run.status not in {"waiting_for_documents", "partial_result", "invalidated", "continued"}:
         raise HTTPException(409, "ANALYSIS_NOT_RESUMABLE")
     try:

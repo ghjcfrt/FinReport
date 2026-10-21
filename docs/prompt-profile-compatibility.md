@@ -1,0 +1,13 @@
+# 分析智能体提示词版本与历史回放边界
+
+`agent_prompt_registry.py`登记两个已知独立义务任务基础提示词。旧版SHA-256为 `33c9ce77e8c4c5852a6499e8c1dc7c36ece6c72c47884c0527ddb5b071bd6b76`；当前版为 `b8ef48053eb58609170d5859232f3aba8605b577dc34ee7b7b2055e8c3d318bf`。旧版由可信当前文本的固定历史边界重构，结果仍须精确匹配旧摘要；不直接执行或采用保存文件中的任意system文字。当前基础文本修改后必须明确登记新版本，否则在付费请求前报注册漂移。
+
+新运行在实际生成请求时保存 `prompt_profile`，包含注册协议版本、基础提示词版本、请求投影版本及完整system哈希。`claim_support_v1`和来源准入后缀仍按已校验的运行策略重构，不能通过选择旧基础提示词移除后缀。已保存profile中的任意未知字段、未知版本、错误hash或不相容payload版本均拒绝。
+
+没有profile的历史记录只接受与已注册可信重构逐字相同的system；这不是任意保存提示词的兼容通道。原始request哈希、user payload、Schema、工具轨迹和最终结果继续独立核对，不因system识别成功而跳过。
+
+当前52个已保存记录离线复查中，49个通过；3个旧任务记录可以识别其旧system，但其完整user payload已无法由当前实现逐字重构，明确返回 `REPLAY_AGENT_LEGACY_PAYLOAD_PROFILE_UNAVAILABLE`。具体为 `h1-batch-completion`、`h1-offline-preflight`、`h1-one-batch`。旧记录使用全量finding、全量计算及旧来源窗口；当前实现使用压缩投影、更新后的Schema描述及现金流来源优先规则。不能仅删掉新字段就证明还原原执行程序。
+
+旧source-manifest主要保存源码哈希，未随这三份记录保存当时完整实现；本次未用saved user反填期望值、未放宽数值/引用验证、未重新写历史结果或hash。恢复这三份记录需要补回可认证的原源码/依赖，再实现并验证相应历史请求与运行策略。当前不宣称52/52历史兼容。
+
+本次复查为0模型调用，52份原文件字节均保持不变。结果保存于 `tmp/semantic-validation-20261019/history-replay-prompt-profile.json`。专项测试覆盖可信历史基础文本、新profile回放、篡改system并重算外层hash、移除后缀、profile降级、未知payload和真实旧payload边界。

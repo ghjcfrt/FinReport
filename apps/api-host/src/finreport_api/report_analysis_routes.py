@@ -32,6 +32,21 @@ class ProviderReasoningView(BaseModel):
     calls: list[ProviderReasoningCall]
 
 
+class SemanticLinkFindingView(BaseModel):
+    finding_id: str
+    topic: str
+    obligation_id: str
+    status: Literal["not_verified"] = "not_verified"
+    reason: str
+
+
+class SemanticLinkSummary(BaseModel):
+    status: Literal["not_applicable", "not_verified", "legacy_not_recorded"]
+    policy: str | None = None
+    findings: list[SemanticLinkFindingView] = Field(default_factory=list)
+    boundary: str
+
+
 class ReportAnalysisView(BaseModel):
     analysis_run_id: int
     filing_version_id: int
@@ -43,6 +58,7 @@ class ReportAnalysisView(BaseModel):
     orchestration_version: str | None
     invalidated_at: datetime | None
     provider_reasoning: ProviderReasoningView
+    semantic_link_summary: SemanticLinkSummary
 
 
 class ReportAnalysisEnvelope(BaseModel):
@@ -122,6 +138,45 @@ def _run(session: Session, run_id: int) -> AnalysisRun:
     return run
 
 
+def _semantic_link_summary(output: dict | None) -> dict:
+    workflow = output.get("agent_workflow") if isinstance(output, dict) else None
+    if not isinstance(workflow, dict):
+        return {
+            "status": "not_applicable",
+            "policy": None,
+            "findings": [],
+            "boundary": "本次输出没有多轮子命题工作流；没有可登记的子命题关联状态。",
+        }
+    policy = workflow.get("semantic_policy")
+    if not policy:
+        return {
+            "status": "legacy_not_recorded",
+            "policy": None,
+            "findings": [],
+            "boundary": "历史工作流未记录独立的子命题关联核验策略；不能把 finding 与 obligation_id 的并列视为语义关联已确认。",
+        }
+    findings = []
+    for item in workflow.get("findings", []):
+        if not isinstance(item, dict):
+            continue
+        if item.get("evidence_kind") != "company_disclosure" or not item.get("obligation_id"):
+            continue
+        findings.append({
+            "finding_id": str(item.get("id", "")),
+            "topic": str(item.get("topic", "")),
+            "obligation_id": str(item["obligation_id"]),
+            "status": "not_verified",
+            "reason": "系统未保存独立的子命题关联核验结果；该原文仅作为候选引用，不构成该子命题结论。",
+        })
+    return {
+        "status": "not_verified" if findings else "not_applicable",
+        "policy": policy,
+        "findings": findings,
+        "boundary": ("公司原文 finding 的子命题关联均未保存独立核验结果；客户端不得仅凭 obligation_id 将其视为完成。"
+                      if findings else "当前工作流没有登记需要提示的公司原文与子命题关联候选。"),
+    }
+
+
 def _background_report_analysis(run_id: int) -> None:
     from finance_adapters.persistence.database import SessionLocal
     from finance_adapters.providers.report_analysis import run_report_analysis
@@ -185,7 +240,8 @@ def get_report_analysis(request: Request, analysis_run_id: int,
                               "tool_trace_hash": run.tool_trace_hash,
                               "orchestration_version": run.orchestration_version,
                               "invalidated_at": run.invalidated_at,
-                              "provider_reasoning": provider_reasoning(run.tool_trace)})
+                              "provider_reasoning": provider_reasoning(run.tool_trace),
+                              "semantic_link_summary": _semantic_link_summary(run.output)})
 
 
 @router.get("/api/v1/report-analyses/{analysis_run_id}/replay")

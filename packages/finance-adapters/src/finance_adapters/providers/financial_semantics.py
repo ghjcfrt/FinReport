@@ -9,9 +9,14 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Mapping
+from contextvars import ContextVar
+from functools import wraps
 from typing import Any
 
 RULE_VERSION = "financial_semantic_guards_v1"
+CLAIM_SUPPORT_POLICY_V1 = "claim_support_v1"
+CLAIM_SUPPORT_POLICY_V2 = "claim_support_v2"
+SUPPORTED_CLAIM_SUPPORT_POLICIES = frozenset({CLAIM_SUPPORT_POLICY_V1, CLAIM_SUPPORT_POLICY_V2})
 
 _FINANCIAL_ASSET_RELATION = re.compile(
     r"非金融企业.{0,80}?持有\s*金融资产和金融负债", re.DOTALL
@@ -61,6 +66,22 @@ _CAUSAL_DRIVER_FAMILIES = tuple(re.compile(pattern) for pattern in (
     r"销售结构|产品结构", r"渠道", r"账期|信用政策",
     r"应收账款周转", r"应付账款周转",
 ))
+
+_RELATION_SPLIT = re.compile(r"[。！？；;\n]")
+_SUPPORT_POLICY: ContextVar[str | None] = ContextVar("financial_claim_support_policy", default=None)
+VERIFIED_BOUNDARY_STATEMENTS = frozenset({
+    "仅保留原文，不作额外事实或因果判断。",
+    "所引原文仅供核对，当前解释尚未获得语义支持确认。",
+    "当前证据不足以支持该项判断。",
+    "现有材料尚不足以确认本主题事项。",
+    "尚需核对完整披露，保留证据判断边界。",
+    "限制仅依据所引来源的质量元数据，未将原文正文作为实质证据。",
+    "证据不足：所引来源含有问项上下文不完整的原文块，暂不能据此作实质判断。",
+    "证据不足：所引来源含有选项状态存在歧义的原文块，暂不能据此作实质判断。",
+    "证据不足：所引来源含有尚未获人工审核确认的原文块，暂不能据此作实质判断。",
+})
+ITEM_SUPPORT_BOUNDARY = "所引原文仅供核对，当前解释尚未获得语义支持确认。"
+ITEM_SUPPORT_GAP_BOUNDARY = "该项形成原因、业务背景或持续性尚需补充披露，当前不作事实或因果判断。"
 
 
 class FinancialSemanticError(ValueError):
@@ -216,6 +237,95 @@ def _business_causal_assertion(value: str):
     return None
 
 
+def current_support_policy() -> str | None:
+    """The active, frozen admission policy for the current workflow only."""
+    return _SUPPORT_POLICY.get()
+
+
+def support_policy_scope(policy_getter):
+    """Activate a policy for one sync workflow and reset it even on errors.
+
+    ContextVar avoids cross-thread/task leakage.  The getter is explicit at
+    each entrypoint; replay reads the policy recorded in the saved artifact,
+    while a new run enables the current version.
+    """
+    def decorate(function):
+        @wraps(function)
+        def wrapped(*args, **kwargs):
+            policy = policy_getter(*args, **kwargs)
+            if policy is not None and policy not in SUPPORTED_CLAIM_SUPPORT_POLICIES:
+                raise ValueError("AGENT_SEMANTIC_POLICY_MISMATCH")
+            token = _SUPPORT_POLICY.set(policy)
+            try:
+                return function(*args, **kwargs)
+            finally:
+                _SUPPORT_POLICY.reset(token)
+        return wrapped
+    return decorate
+
+
+def _complete_source_spans(source_id: str, source: dict[str, Any]):
+    text = _source_text(source)
+    # Keep the entire retrieved unit: a preceding sentence may qualify every
+    # later sentence (scenario, hypothetical example, exception, etc.).  A
+    # sentence boundary alone is not evidence of an independent proposition.
+    if text:
+        yield _source_evidence(source_id, source, 0, len(text))
+
+
+def _claim_support_issues(candidate: dict[str, Any], cited: list[tuple[str, dict[str, Any]]],
+                          verified_statement: str | None = None,
+                          verified_text_fields: Mapping[str, str] | None = None, *,
+                          support_policy: str = CLAIM_SUPPORT_POLICY_V1) -> list[dict[str, Any]]:
+    """Quarantine unverifiable free prose instead of guessing entailment.
+
+    A lexical similarity score cannot establish Chinese financial entailment.
+    Only complete verbatim retrieved units and fixed nonfactual boundary
+    statements are automatically supported here.  A valid synonym or a new
+    conditional inference is therefore *unverified*, never labelled false.
+    Raw candidates and all cited passages remain in the admission receipt for
+    a separate semantic review; they cannot enter the admitted facts.
+    """
+    if candidate.get("evidence_kind") == "program_fact":
+        return []  # Numerical findings are rendered and checked by the server.
+    evidence = [span for source_id, source in cited
+                for span in _complete_source_spans(source_id, source)]
+    complete_passages = {span["text"] for span in evidence}
+    issues = []
+    for field, value in _candidate_text_fields(candidate):
+        if field == "statement" and verified_statement == value:
+            continue  # Caller authenticated this exact complete source unit.
+        if (verified_text_fields or {}).get(field) == value:
+            continue  # Caller checked an exact source label + fixed boundary.
+        body = value.removeprefix("分析推断：").removeprefix("原文披露：").removeprefix("公司披露：")
+        # ``analysis_inference`` is not a provenance label.  Under this
+        # conservative policy its statement may express a fixed evidence
+        # boundary only; copying a disclosure does not turn it into analysis.
+        exact_disclosure = body in complete_passages and not (
+            candidate.get("evidence_kind") == "analysis_inference" and field == "statement")
+        if support_policy == CLAIM_SUPPORT_POLICY_V2:
+            # A true quotation does not establish that it supports another
+            # statement. Keep quotes in their provenance-labelled observation
+            # field; rationale/reason may contain neutral boundaries or an
+            # exact fixed template authenticated by the server caller above.
+            exact_disclosure = (exact_disclosure and field == "statement"
+                                and candidate.get("evidence_kind") == "company_disclosure")
+            safe_boundary = (body if field == "statement" else value) in VERIFIED_BOUNDARY_STATEMENTS
+        else:
+            safe_boundary = body in VERIFIED_BOUNDARY_STATEMENTS
+        if exact_disclosure or safe_boundary:
+            continue
+        item = _make_issue(
+            "CLAIM_SUPPORT_UNVERIFIED", field, value, 0, len(value),
+            "自由改写尚无可靠的主张—证据蕴含校验；保留候选待核对，不能将其视为语义错误或已支持事实。",
+            evidence,
+        )
+        item.update(status="needs_review", support_policy=support_policy,
+                    original_text=value, admission="quarantined")
+        issues.append(item)
+    return issues
+
+
 def _make_issue(code: str, field: str, value: str, start: int, end: int,
                 rule_note: str, evidence: list[dict[str, Any]]) -> dict[str, Any]:
     left, right = max(0, start - 80), min(len(value), end + 120)
@@ -229,9 +339,20 @@ def _make_issue(code: str, field: str, value: str, start: int, end: int,
     }
 
 
-def semantic_issues(candidate: Any, sources: Mapping[str, Any] | list[Any]) -> list[dict[str, Any]]:
-    """Return auditable issues for a narrow set of high-risk financial claims."""
+def semantic_issues(candidate: Any, sources: Mapping[str, Any] | list[Any], *,
+                    support_policy: str | None = None,
+                    verified_statement: str | None = None,
+                    verified_text_fields: Mapping[str, str] | None = None) -> list[dict[str, Any]]:
+    """Return auditable issues for bounded financial claims.
+
+    ``support_policy`` is opt-in so v2-v11 replay bundles retain their exact
+    historical guard behavior.  New V3 evidence workflows pass
+    :data:`CLAIM_SUPPORT_POLICY_V1`, which quarantines unverified free prose
+    while preserving the existing bounded rules.
+    """
     finding = _as_dict(candidate)
+    if support_policy is not None and support_policy not in SUPPORTED_CLAIM_SUPPORT_POLICIES:
+        raise ValueError("AGENT_SEMANTIC_POLICY_MISMATCH")
     source_map = _normalize_sources(sources)
     cited = _cited_sources(finding, source_map)
     fields = list(_candidate_text_fields(finding))
@@ -301,6 +422,10 @@ def semantic_issues(candidate: Any, sources: Mapping[str, Any] | list[Any]) -> l
                     "现金流调节表只能支持会计桥接；该候选将其表述为未经直接披露支持的业务原因。",
                     bridge_evidence,
                 ))
+
+    if support_policy in SUPPORTED_CLAIM_SUPPORT_POLICIES:
+        issues.extend(_claim_support_issues(finding, cited, verified_statement, verified_text_fields,
+                                            support_policy=support_policy))
 
     return issues
 

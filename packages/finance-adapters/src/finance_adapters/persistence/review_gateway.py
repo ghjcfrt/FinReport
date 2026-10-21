@@ -4,6 +4,7 @@ import re
 from datetime import date
 from decimal import Decimal, localcontext
 
+from finance_domain.decimal_policy import financial_context
 from finance_domain.filings.concepts import STATEMENT_ALIASES, validate_concept_metadata
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -60,6 +61,13 @@ def recompute_filing_quality(session: Session, filing_id: int) -> str:
     filing = session.get(FilingVersion, filing_id)
     if filing is None:
         raise ValueError('FILING_NOT_FOUND')
+    from finance_adapters.persistence.auto_validation_gateway import (
+        current_auto_receipt,
+        uses_automatic_policy,
+    )
+    automatic = uses_automatic_policy(filing)
+    auto_decisions = ({item.fact_id: item for item in current_auto_receipt(session, filing).decisions}
+                      if automatic else {})
     # Recompute our own findings after corrections; retain source/parser failures.
     session.execute(ValidationResult.__table__.delete().where(
         ValidationResult.filing_version_id == filing_id,
@@ -111,11 +119,19 @@ def recompute_filing_quality(session: Session, filing_id: int) -> str:
                  and fact.concept_code not in codes)
         if not fact.comparative_period:
             metadata_valid = metadata_valid and valid
-        if (valid and any(_located(item) for item in evidence)
-                and has_current_approvals(fact, reviews, evidence, dimensions[fact.id])):
-            fact.review_status, fact.quality_status = 'verified', 'facts_verified'
+        auto_decision = auto_decisions.get(fact.id)
+        approved = (auto_decision is not None and auto_decision.status == 'auto_passed') if automatic else (
+            has_current_approvals(fact, reviews, evidence, dimensions[fact.id]))
+        if valid and any(_located(item) for item in evidence) and approved:
+            fact.review_status, fact.quality_status = (('auto_passed', 'auto_passed') if automatic
+                                                       else ('verified', 'facts_verified'))
         else:
-            fact.review_status, fact.quality_status = 'needs_review', 'candidate'
+            if automatic:
+                status = (auto_decision.status if auto_decision is not None
+                          and auto_decision.status != 'auto_passed' else 'needs_review')
+                fact.review_status = fact.quality_status = status
+            else:
+                fact.review_status, fact.quality_status = 'needs_review', 'candidate'
             if not fact.comparative_period:
                 all_verified = False
         if fact.comparative_period:
@@ -136,8 +152,9 @@ def recompute_filing_quality(session: Session, filing_id: int) -> str:
         required = {left_code, *right_codes}
         if not required.issubset(by_code):
             return record(code, False, 'missing_required_fact', '+'.join(right_codes))
-        with localcontext() as context:
-            context.prec = 48
+        if automatic and any(by_code[c].quality_status != 'auto_passed' for c in required):
+            return record(code, False, 'automatic_source_binding_unavailable', '+'.join(right_codes))
+        with localcontext(financial_context()):
             left = by_code[left_code].value
             right = sum((by_code[c].value for c in right_codes), Decimal(0))
             # Each displayed amount can round by half one original display unit.

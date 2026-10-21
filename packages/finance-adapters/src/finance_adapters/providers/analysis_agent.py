@@ -9,9 +9,11 @@ import hashlib
 import json
 import re
 from collections.abc import Callable
+from contextvars import ContextVar
 from copy import deepcopy
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from functools import wraps
 from itertools import pairwise
 from typing import Literal
 
@@ -41,6 +43,11 @@ from finance_adapters.persistence.metric_gateway import (
 )
 from finance_adapters.persistence.models import FilingVersion
 from finance_adapters.providers import evidence_retrieval as retrieval
+from finance_adapters.providers.agent_prompt_registry import (
+    is_registered_legacy_task_prompt,
+    new_prompt_profile,
+    replay_prompt,
+)
 from finance_adapters.providers.cashflow_units import reconciliation_units
 from finance_adapters.providers.evidence_completeness import (
     REPAIR_LIMIT,
@@ -50,7 +57,17 @@ from finance_adapters.providers.evidence_completeness import (
     row_source_units,
     validate_item_assessments,
 )
-from finance_adapters.providers.financial_semantics import FinancialSemanticError, semantic_issues
+from finance_adapters.providers.financial_semantics import (
+    CLAIM_SUPPORT_POLICY_V1,
+    CLAIM_SUPPORT_POLICY_V2,
+    ITEM_SUPPORT_BOUNDARY,
+    ITEM_SUPPORT_GAP_BOUNDARY,
+    VERIFIED_BOUNDARY_STATEMENTS,
+    FinancialSemanticError,
+    current_support_policy,
+    semantic_issues,
+    support_policy_scope,
+)
 from finance_adapters.providers.model_clients import (
     ModelClient,
     ModelConfig,
@@ -91,6 +108,8 @@ QUOTATION_POLICY_VERSION = "exact_complete_evidence_unit_v2"
 SYNTHESIS_COVERAGE_POLICY_VERSION = "retrieved_topic_reservations_v1"
 MATERIAL_AVAILABILITY_POLICY_VERSION = "read_local_evidence_before_material_request_v1"
 CANDIDATE_ADMISSION_POLICY_VERSION = "individual_candidates_after_atomic_action_v1"
+SOURCE_UNIT_ADMISSION_POLICY_V1 = "certified_source_unit_local_admission_v1"
+_SOURCE_UNIT_ADMISSION_POLICY: ContextVar[str | None] = ContextVar("source_unit_admission_policy", default=None)
 QUESTION_UNIT_POLICY_VERSION = "closed_numbered_question_with_unique_selection_v1"
 V10_QUESTION_UNIT_POLICY_VERSION = "closed_question_with_unique_selection_v2"
 # v11 splits broad topics into atomic evidence obligations.  The policy is
@@ -321,6 +340,52 @@ company_disclosure的assessment必须为observation；披露事实不能冒充�
 无引用证据不足必须逐字使用unreferenced_insufficiency_template中的statement和rationale，两者都不得扩写。具体需核对章节写入material_requirements，不写成“未披露/未见/不存在”。只表明当前证据不能支撑判断，不表明已经查遍财报。
 现金流业务原因的边界判断应表达“所引调节表不能独立支持具体业务因果判断”，不要断言现有材料未披露原因、不要把应收项目直接称为回款原因。调节表优先引用complete_cashflow_reconciliation的source_unit_id，statement仅填公司披露：。
 """
+CLAIM_SUPPORT_SYSTEM_SUFFIX = (
+    "\n主张支持校验 claim_support_v1：未经确认的自由解释会保留为needs_review候选，"
+    "不能进入已接纳事实；不是宣称解释错误。company_disclosure继续逐字选择认证原文，"
+    "rationale及reason可逐字引用完整原文或使用以下中性依据句，不要自行改写主体、对象、"
+    "否定、条件或因果：" + json_text(sorted(VERIFIED_BOUNDARY_STATEMENTS))
+    + "。有公司事实、原因或风险主张的解释不得仅加证据不足前缀绕过校验。"
+    + "逐行reason如不逐字复制完整来源，请使用该行完整原文raw_label（仅合并空白）加中文分号，"
+    "再接以下固定边界句之一：" + json_text([ITEM_SUPPORT_BOUNDARY, ITEM_SUPPORT_GAP_BOUNDARY])
+    + "。此类reason只保留行锚点和解释边界，不表示已完成业务原因或持续性分析。"
+    + "analysis_inference的assessment仅允许observation，statement仅使用固定边界句并保留分析推断：前缀；"
+    "逐字披露应使用company_disclosure，不得靠推断类型或signal_found状态宣称已验证财务信号。"
+)
+CLAIM_SUPPORT_V2_SYSTEM_SUFFIX = (
+    "\n主张支持校验 claim_support_v2：本段优先于原自由解释约定。未经确认的自由解释保留为needs_review候选，"
+    "不能进入已接纳事实，也不表示解释错误。完整逐字来源仅作为company_disclosure的statement原文观察；"
+    "不能把另一来源中真实出现的文字直接作为当前主张的依据，来源并列不证明主体、期间、口径或条件一致。"
+    "rationale及reason仅逐字使用以下中性边界句：" + json_text(sorted(VERIFIED_BOUNDARY_STATEMENTS))
+    + "。逐行reason也可使用程序提供的完整raw_label（仅合并空白）加中文分号，再接固定边界句之一："
+    + json_text([ITEM_SUPPORT_BOUNDARY, ITEM_SUPPORT_GAP_BOUNDARY])
+    + "。此类reason仅保留行锚点和解释边界；不能自填认证标志或verified_text_fields授权。"
+    "analysis_inference的assessment仅允许observation，statement仅使用固定边界句并保留分析推断：前缀；"
+    "逐字披露不得冒充已验证分析，也不得将证据不足前缀当作额外企业事实的支持。"
+)
+
+
+def _claim_support_system_suffix() -> str:
+    policy = current_support_policy()
+    if policy == CLAIM_SUPPORT_POLICY_V2:
+        return CLAIM_SUPPORT_V2_SYSTEM_SUFFIX
+    if policy == CLAIM_SUPPORT_POLICY_V1:
+        return CLAIM_SUPPORT_SYSTEM_SUFFIX
+    if policy is None:
+        return ""
+    raise ValueError("AGENT_SEMANTIC_POLICY_MISMATCH")
+
+
+SOURCE_UNIT_ADMISSION_SYSTEM_SUFFIX = (
+    "\n完整来源上下文准入 certified_source_unit_local_admission_v1：本段优先于此前局部引文约定。"
+    "company_disclosure必须逐字保留一个已保存parent source的完整正文，只可省略外围纯空白；"
+    "结构完整的问项、表格、子表或注释若只是parent的一部分，也不能单独认证。"
+    "source_units只提供覆盖完整parent的单元；使用真实source_unit_id时statement可仅填公司披露：，"
+    "或该前缀加单元完整原文，程序不会替错误正文扩充或修复。"
+    "完整parent超过引文长度限制时保留未解决状态，不截短或反复改写试探。"
+    "协议、长度或引用失败不是财务缺证，不能改名为证据不足；真正缺证才使用指定不足模板并登记具体缺项。"
+    "逐字观察只证明本地保存文本一致，不证明公司事实、子命题语义判断或全文分析已完成。"
+)
 
 
 class FindingCandidate(BaseModel):
@@ -698,6 +763,17 @@ def _program_findings(calculations: list[dict]) -> list[WorkflowFinding]:
                          "净利润与经营活动现金流净额同比变化方向相反。" if detail.get("opposite_change_directions") else
                          "已比较净利润与经营活动现金流净额同比变化方向，未出现方向相反，不能外推其他财务信号。") if is_direction else (
                              f"{label}：{Decimal(result['value']):,.4f}{unit}。")
+            if current_support_policy() and result["code"] in {"nonrec_signed_bridge", "cashflow_signed_bridge"}:
+                statement = (
+                    f"{label}的勾稽残差（逐行有符号合计减披露合计）："
+                    f"{Decimal(result['value']):,.4f}{unit}。"
+                )
+                if all(detail.get(key) is not None for key in ("signed_sum", "disclosed_total")):
+                    statement += (
+                        f"逐行有符号合计{Decimal(str(detail['signed_sum'])):,.4f}{unit}，"
+                        f"披露合计{Decimal(str(detail['disclosed_total'])):,.4f}{unit}。"
+                    )
+                statement += "残差为零仅表示该表算术勾稽一致，不表示业务影响为零或原因已确认。"
             if result.get("period_start") and result.get("period_end"):
                 statement = f"{result['period_start']}至{result['period_end']}，" + statement
             if not is_direction and all(detail.get(key) is not None for key in ("current", "prior", "difference")):
@@ -968,6 +1044,23 @@ def _scope_assertion_view_v11(text: str) -> str:
     return "\n".join(clause for clause in re.split(
         r"[，,。；;！？!?\n]|但是|然而|不过|并且|而且|但|却|且", text,
     ) if not re.fullmatch(operation, clause))
+
+
+def source_unit_admission_policy_scope(policy_getter):
+    """Freeze local quotation admission for new runs without rejudging old traces."""
+    def decorate(function):
+        @wraps(function)
+        def wrapped(*args, **kwargs):
+            policy = policy_getter(*args, **kwargs)
+            if policy not in {None, SOURCE_UNIT_ADMISSION_POLICY_V1}:
+                raise ValueError("AGENT_SOURCE_UNIT_ADMISSION_POLICY_MISMATCH")
+            token = _SOURCE_UNIT_ADMISSION_POLICY.set(policy)
+            try:
+                return function(*args, **kwargs)
+            finally:
+                _SOURCE_UNIT_ADMISSION_POLICY.reset(token)
+        return wrapped
+    return decorate
 
 
 def _cashflow_subtable_units_v11(source: dict) -> list[dict]:
@@ -1309,11 +1402,33 @@ def _selectable_source_units(source: dict, *, version: str = WORKFLOW_VERSION,
             units.extend(_independent_note_units(source))
         if coverage_policy in ROW_COVERAGE_POLICIES:
             units.extend(row_source_units(source))
+    if _SOURCE_UNIT_ADMISSION_POLICY.get() == SOURCE_UNIT_ADMISSION_POLICY_V1:
+        # Structural closure does not prove semantic independence. A later
+        # numbered paragraph or earlier report heading can still qualify any
+        # question, note, row or table. Only units retaining the whole saved
+        # parent context may carry automatic literal support under this policy.
+        units = [unit for unit in units if not source["text"][:unit["start"]].strip()
+                 and not source["text"][unit["end"]:].strip()]
     return [{**unit, "source_unit_id": "unit-" + stable_hash({
                 "parent_source_id": source["id"], "parent_text_sha256": source["text_sha256"],
                 "start": unit["start"], "end": unit["end"], "kind": unit["kind"],
             })[:32], "parent_source_id": source["id"], "parent_text_sha256": source["text_sha256"],
              "text": source["text"][unit["start"]:unit["end"]]} for unit in units]
+
+
+def _certified_local_quote_unit(statement: str, source: dict, *, version: str,
+                                coverage_policy: str | None) -> dict | None:
+    if _SOURCE_UNIT_ADMISSION_POLICY.get() != SOURCE_UNIT_ADMISSION_POLICY_V1:
+        return None
+    unit = next((unit for unit in _selectable_source_units(source, version=version, coverage_policy=coverage_policy)
+                 if statement == "公司披露：" + unit["text"]), None)
+    if unit is None and (statement.startswith("公司披露：")
+            and statement[len("公司披露："):].strip() == source["text"].strip()
+            and hashlib.sha256(source["text"].encode("utf-8")).hexdigest() == source.get("text_sha256")):
+        unit = {"kind": "complete_parent_context", "policy": SOURCE_UNIT_ADMISSION_POLICY_V1,
+                "parent_source_id": source["id"], "parent_text_sha256": source["text_sha256"],
+                "start": 0, "end": len(source["text"]), "text": source["text"]}
+    return unit
 
 
 def _validate_finding(candidate: FindingCandidate, sources: dict[str, dict], package: dict,
@@ -1356,7 +1471,26 @@ def _validate_finding(candidate: FindingCandidate, sources: dict[str, dict], pac
                       and len(selected) == 1 and _question_quote_unit(candidate.statement, selected[0], version=version))
     note_quote = (version == V11_WORKFLOW_VERSION and candidate.evidence_kind == "company_disclosure"
                   and len(selected) == 1 and _note_quote_unit(candidate.statement, selected[0], coverage_policy=coverage_policy))
-    if any(source.get("question_completeness") == "incomplete_question" for source in selected) and not (question_quote or note_quote):
+    local_quote = (candidate.evidence_kind == "company_disclosure" and len(selected) == 1
+                   and _certified_local_quote_unit(candidate.statement, selected[0], version=version,
+                                                   coverage_policy=coverage_policy))
+    if (_SOURCE_UNIT_ADMISSION_POLICY.get() == SOURCE_UNIT_ADMISSION_POLICY_V1
+            and candidate.evidence_kind == "company_disclosure"):
+        # Legacy question/note exceptions cannot certify a fragment under the
+        # new policy. Keep the original candidate quarantined instead of
+        # guessing whether excluded context governs the quoted assertion.
+        question_quote = note_quote = None
+        if selected and not local_quote:
+            raise FinancialSemanticError([{
+                "code": "CLAIM_SOURCE_CONTEXT_UNVERIFIED", "field": "statement",
+                "excerpt": candidate.statement, "original_text": candidate.statement,
+                "source_evidence": [{"source_id": source["id"], "text": source["text"]}
+                                    for source in selected],
+                "rule_version": "financial_semantic_guards_v1", "support_policy": current_support_policy(),
+                "status": "needs_review", "admission": "quarantined",
+                "rule_note": "局部结构完整不能证明与父块上下文语义独立；仅完整保留已保存父块可获得字面引用支持。",
+            }])
+    if any(source.get("question_completeness") == "incomplete_question" for source in selected) and not (question_quote or note_quote or local_quote):
         raise ValueError("AGENT_INCOMPLETE_QUESTION_SOURCE")
     if any(source.get("review_status") == "rejected" for source in selected):
         raise ValueError("AGENT_REJECTED_SOURCE")
@@ -1425,8 +1559,51 @@ def _validate_finding(candidate: FindingCandidate, sources: dict[str, dict], pac
             _validate_explanation(text)
     if candidate.assessment == "not_identified_in_checked_scope" and not selected:
         raise ValueError("AGENT_CHECKED_SCOPE_REQUIRES_SOURCES")
-    if coverage_policy == OBLIGATION_TASK_POLICY_V1:
-        issues = semantic_issues(candidate, selected)
+    if current_support_policy() and candidate.evidence_kind == "analysis_inference" and candidate.assessment != "observation":
+        raise FinancialSemanticError([{
+            "code": "CLAIM_ASSESSMENT_UNVERIFIED", "field": "assessment",
+            "excerpt": candidate.assessment, "original_text": candidate.assessment,
+            "source_evidence": [], "rule_version": "financial_semantic_guards_v1",
+            "support_policy": current_support_policy(), "status": "needs_review", "admission": "quarantined",
+            "rule_note": "发现信号、未发现信号或不适用本身也是分析主张；自由解释未经独立支持确认，仅可保留为观察候选。",
+        }])
+    if coverage_policy == OBLIGATION_TASK_POLICY_V1 or current_support_policy():
+        # These are deterministic omission receipts, not model explanations.
+        # Keep the exact registered label and text, so a model cannot append
+        # an unsupported company fact under the same insufficiency prefix.
+        generated_boundaries = {
+            (f"现有已取证材料尚不足以完成子命题“{label}”。",
+             "必查检索已执行，但模型未提交通过引用校验的该子命题结论；主题内其他子命题不能替代本项，也不能据此判断企业没有相关信号。")
+            for _, label in _obligation_items(candidate.topic)
+        }
+        generated_boundaries.add(("现有已取证材料尚不足以完成本主题判断。",
+            "必查检索已执行，但模型未提交通过引用校验的主题结论；不能据此判断企业没有相关信号。"))
+        support = current_support_policy()
+        if (candidate.evidence_kind == "evidence_insufficient"
+                and (candidate.statement, candidate.rationale) in generated_boundaries):
+            support = None
+        verified_statement = candidate.statement if local_quote else None
+        if candidate.evidence_kind == "company_disclosure" and any(
+            candidate.statement == "公司披露：" + unit["text"]
+            for source in selected for unit in _selectable_source_units(
+                source, version=version, coverage_policy=coverage_policy)
+        ):
+            verified_statement = candidate.statement
+        verified_text_fields = {}
+        if candidate.evidence_item_assessments:
+            manifest = build_manifest(list(sources.values()), package_documents(package))
+            items_by_id = {item["id"]: item for item in manifest["items"]}
+            for index, item_assessment in enumerate(candidate.evidence_item_assessments):
+                item = items_by_id.get(item_assessment.item_id)
+                if item is None:
+                    continue
+                label = "非经常性损益" if item["row_role"] == "declaration" else re.sub(r"\s+", "", item["raw_label"])
+                allowed = {label + "；" + suffix for suffix in (ITEM_SUPPORT_BOUNDARY, ITEM_SUPPORT_GAP_BOUNDARY)}
+                if item_assessment.reason in allowed:
+                    verified_text_fields[f"evidence_item_assessments[{index}].reason"] = item_assessment.reason
+        issues = semantic_issues(candidate, selected, support_policy=support,
+                                  verified_statement=verified_statement,
+                                  verified_text_fields=verified_text_fields)
         if issues:
             raise FinancialSemanticError(issues)
     payload = candidate.model_dump(mode="json")
@@ -1452,6 +1629,10 @@ def _validate_disclosure_excerpt(statement: str, source: dict, *, version: str =
         raise ValueError("AGENT_COMPANY_DISCLOSURE_MUST_QUOTE_EXACT_SOURCE")
     if not DISCLOSURE_EXCERPT_MIN_CHARACTERS <= len(excerpt) <= DISCLOSURE_EXCERPT_MAX_CHARACTERS:
         raise ValueError("AGENT_COMPANY_DISCLOSURE_EXCERPT_LENGTH_INVALID")
+    if _certified_local_quote_unit(statement, source, version=version, coverage_policy=coverage_policy):
+        return
+    if _SOURCE_UNIT_ADMISSION_POLICY.get() == SOURCE_UNIT_ADMISSION_POLICY_V1:
+        raise ValueError("AGENT_DISCLOSURE_PARENT_CONTEXT_REQUIRED")
     if version == V11_WORKFLOW_VERSION and _note_quote_unit(statement, source, coverage_policy=coverage_policy):
         return
     if (coverage_policy in ROW_COVERAGE_POLICIES and any(
@@ -2136,6 +2317,9 @@ def _mandatory_checks(findings: list[WorkflowFinding], sources: dict[str, dict],
                      if coverage_policy in ROW_COVERAGE_POLICIES else None)
     for topic in MANDATORY_TOPICS:
         related = [item for item in findings if item.topic == topic]
+        literal_support_pending = _SOURCE_UNIT_ADMISSION_POLICY.get() == SOURCE_UNIT_ADMISSION_POLICY_V1 and any(
+            item.evidence_kind == "company_disclosure" and item.review_required for item in related
+        )
         ids = sorted({source_id for item in related for source_id in item.source_ids})
         searches = [item["arguments"]["query"] for item in calls if item.get("topic") == topic
                     and item["name"] == "search_text"]
@@ -2147,6 +2331,7 @@ def _mandatory_checks(findings: list[WorkflowFinding], sources: dict[str, dict],
             source_review_pending = source_review_pending or any(
                 item.evidence_kind == "program_fact" and item.review_required for item in related
             )
+        source_review_pending = source_review_pending or literal_support_pending
         obligations = []
         if _obligation_enabled(version=version, coverage_policy=coverage_policy):
             for obligation_id, label in _obligation_items(topic):
@@ -2157,10 +2342,16 @@ def _mandatory_checks(findings: list[WorkflowFinding], sources: dict[str, dict],
                     sources.get(source_id, {}).get("review_status") != "confirmed"
                     for source_id in matching_sources
                 ) or any(item.review_required for item in matching if item.evidence_kind == "program_fact")
+                literal_obligation_pending = _SOURCE_UNIT_ADMISSION_POLICY.get() == SOURCE_UNIT_ADMISSION_POLICY_V1 and any(
+                    item.evidence_kind == "company_disclosure" and item.review_required for item in matching
+                )
+                has_review_pending = has_review_pending or literal_obligation_pending
                 if any(item.evidence_kind != "evidence_insufficient" for item in matching):
                     obligation_status = "needs_review" if has_review_pending else (
                         "signal_found" if any(item.assessment == "signal_found" for item in matching) else "checked")
                     reason = "该子命题已有带obligation_id的证据或推断；引用原文仍需按审核状态解释。"
+                    if literal_obligation_pending:
+                        reason = "当前仅保留逐字原文观察，尚未确认其支持该子命题的语义判断；填写obligation_id不代表完成分析。"
                 elif matching:
                     obligation_status = "insufficient_evidence"
                     reason = "已登记该子命题，但现有材料或候选结果不足以形成实质结论。"
@@ -2188,7 +2379,10 @@ def _mandatory_checks(findings: list[WorkflowFinding], sources: dict[str, dict],
                 obligations.append({"id": obligation_id, "label": label, "status": obligation_status,
                                     "finding_ids": matching_ids, "source_ids": matching_sources,
                                     "reason": reason, **extra})
-        obligation_incomplete = any(item["status"] in {"insufficient_evidence", "needs_documents"} for item in obligations)
+        incomplete_statuses = {"insufficient_evidence", "needs_documents"}
+        if _SOURCE_UNIT_ADMISSION_POLICY.get() == SOURCE_UNIT_ADMISSION_POLICY_V1:
+            incomplete_statuses.add("needs_review")
+        obligation_incomplete = any(item["status"] in incomplete_statuses for item in obligations)
         status = "needs_documents" if any(item.status == "missing" for item in unresolved) else (
             "insufficient_evidence" if unresolved or source_review_pending else
             "signal_found" if any(item.assessment == "signal_found" for item in related) else
@@ -2199,7 +2393,9 @@ def _mandatory_checks(findings: list[WorkflowFinding], sources: dict[str, dict],
         checks.append(TopicCheck(topic=topic, status=status, source_ids=ids,
             finding_ids=[item.id for item in related], searched_queries=list(dict.fromkeys(searches)),
             coverage_note="仅覆盖列出的检索与引用原文；不能从未命中外推全文不存在。"
-                          + ("所引用原文尚有人工审核需求，相关结果仅为待审核候选。"
+                          + ("逐字原文观察尚未确认支持相应语义判断，不表示子命题分析完成；needs_review为待支持确认状态。"
+                             if literal_support_pending else
+                             "所引用原文尚有人工审核需求，相关结果仅为待审核候选。"
                              if source_review_pending or any(item.status == "needs_review" for item in unresolved) else ""),
             obligations=obligations))
     return checks
@@ -2404,6 +2600,29 @@ def _agent_request(package: dict, document_snapshot: list[dict], sources: dict[s
             "cashflow_boundary": "调节表可支持表内勾稽，不能独立支持业务因果。应收应付列报不等于回款或结算政策变化。",
             "quotation": "company_disclosure使用observation与真实source_unit_id，statement仅填公司披露：；不手抄表格。",
         }
+    if _SOURCE_UNIT_ADMISSION_POLICY.get() == SOURCE_UNIT_ADMISSION_POLICY_V1:
+        payload["source_unit_admission_policy"] = {
+            "version": SOURCE_UNIT_ADMISSION_POLICY_V1,
+            "parent_context": "company_disclosure逐字保留一个已保存parent source完整正文，只可省外围纯空白；任何局部完整结构均不豁免。",
+            "source_unit_statement": "真实source_unit_id仅认证完整parent；statement为公司披露：或该前缀加单元逐字全文，不自动补全或修复。",
+            "unresolved_boundary": "完整parent超过长度限制时保留未解决，不截短、不反复改写。协议、长度或引用失败不等于财务缺证；真正缺证才用固定不足模板并登记具体缺项。",
+            "literal_boundary": "逐字观察只证明已保存文本一致，不证明事实正确、子命题语义完成或全文覆盖；obligation_id不构成分析完成证据。",
+        }
+        payload.setdefault("quotation_policy", {}).update({
+            "exactness": "一个已保存parent source的逐字完整正文，只可省外围纯空白，不拼接、不截取局部结构、不改字形。",
+            "complete_structures": "仅覆盖完整parent正文的source_unit可认证；完整表格、子表、问项或注释若属于局部片段仍不可单独引用。",
+            "complete_questions": "保留完整parent含问项、选项、说明和前后限定；不完整问项只能原样观察，不能替其回答。",
+            "checkbox_context": "完整parent保留全部勾选与限定；字面观察不解除不完整或歧义的语义限制。",
+        })
+        quotation = "company_disclosure使用observation；逐字完整parent或其真实source_unit_id。使用ID时statement仅填公司披露：或该前缀加认证单元逐字全文；局部行不能替代完整parent。"
+        if "row_candidate_protocol" in payload:
+            payload["row_candidate_protocol"]["quotation"] = quotation
+            payload["row_candidate_protocol"].pop("example", None)
+        if "obligation_response_protocol" in payload:
+            payload["obligation_response_protocol"]["quotation"] = quotation
+            payload["obligation_response_protocol"]["failure_boundary"] = (
+                "只补分配任务；协议、长度或引用失败保留未解决，不可改名财务证据不足；不反复截短或改写试探。")
+    if progress and progress.get("obligation_policy") == OBLIGATION_TASK_POLICY_V1:
         payload = _compact_obligation_request(payload)
     return payload
 
@@ -3174,9 +3393,12 @@ def _v7_candidate_dispositions(raw_candidates: list[object], round_number: int,
                              if item["source_unit_id"] == candidate.source_unit_id), None)
                 if unit is None:
                     raise ValueError("AGENT_SOURCE_UNIT_NOT_RETURNED")
-                if candidate.statement != "公司披露：":
-                    raise ValueError("AGENT_SOURCE_UNIT_STATEMENT_MUST_BE_EMPTY")
                 rendered = "公司披露：" + unit["text"]
+                if candidate.statement != "公司披露：":
+                    if _SOURCE_UNIT_ADMISSION_POLICY.get() != SOURCE_UNIT_ADMISSION_POLICY_V1:
+                        raise ValueError("AGENT_SOURCE_UNIT_STATEMENT_MUST_BE_EMPTY")
+                    if candidate.statement != rendered:
+                        raise ValueError("AGENT_SOURCE_UNIT_STATEMENT_MISMATCH")
             else:
                 rendered = candidate.statement
             base_data = candidate.model_dump(exclude={"limitation_source_ids", "source_unit_id"})
@@ -3199,6 +3421,11 @@ def _v7_candidate_dispositions(raw_candidates: list[object], round_number: int,
                         raise ValueError("AGENT_TOPIC_SOURCE_SCOPE_MISMATCH")
             units = [_question_quote_unit(rendered, sources[source_id], version=version)
                      for source_id in candidate.source_ids] if candidate.evidence_kind == "company_disclosure" else []
+            if candidate.evidence_kind == "company_disclosure":
+                units.extend(unit for source_id in candidate.source_ids
+                             if (unit := _certified_local_quote_unit(rendered, sources[source_id], version=version,
+                                                                     coverage_policy=coverage_policy)) is not None
+                             and unit not in units)
             if version == V11_WORKFLOW_VERSION and candidate.evidence_kind == "company_disclosure":
                 units.extend(unit for source_id in candidate.source_ids
                              for unit in _cashflow_subtable_units_v11(sources[source_id])
@@ -3228,6 +3455,9 @@ def _v7_candidate_dispositions(raw_candidates: list[object], round_number: int,
             entry.update(status="rejected", errors=[str(exc)])
             if isinstance(exc, FinancialSemanticError):
                 entry["semantic_issues"] = exc.issues
+                if exc.issues and all(item.get("status") == "needs_review" for item in exc.issues):
+                    entry["semantic_status"] = "needs_review"
+                    entry["admission"] = "quarantined"
         dispositions.append(entry)
     return findings, dispositions
 
@@ -3415,6 +3645,8 @@ def _v7_live_tool(session: Session, trace: dict, name: str, arguments: dict,
     return result
 
 
+@source_unit_admission_policy_scope(lambda *args, **kwargs: SOURCE_UNIT_ADMISSION_POLICY_V1)
+@support_policy_scope(lambda *args, **kwargs: CLAIM_SUPPORT_POLICY_V2)
 def run_evidence_workflow(session: Session, filing: FilingVersion, package: dict, client: ModelClient,
                           trace: dict, *, previous: dict | None = None,
                           save_checkpoint: Callable[[], None] | None = None,
@@ -3422,8 +3654,28 @@ def run_evidence_workflow(session: Session, filing: FilingVersion, package: dict
     """Run the evidence phase; the legacy strict numerical validator stays intact."""
     if coverage_policy not in SUPPORTED_OBLIGATION_POLICIES:
         raise ValueError("AGENT_COVERAGE_POLICY_MISMATCH")
-    workflow_trace = {"version": WORKFLOW_VERSION, "started_at": _now(), "rounds": [], "tool_calls": []}
+    workflow_trace = {"version": WORKFLOW_VERSION, "semantic_policy": current_support_policy(),
+                      "source_unit_admission_policy": _SOURCE_UNIT_ADMISSION_POLICY.get(),
+                      "started_at": _now(), "rounds": [], "tool_calls": []}
     trace["agent"] = workflow_trace
+    if previous and (previous.get("semantic_policy") != current_support_policy()
+                     or previous.get("source_unit_admission_policy") != _SOURCE_UNIT_ADMISSION_POLICY.get()):
+        workflow_trace["previous_policy_reuse"] = {
+            "status": "not_reused", "reason": "ADMISSION_POLICY_CHANGED",
+            "previous_semantic_policy": previous.get("semantic_policy"),
+            "previous_source_unit_admission_policy": previous.get("source_unit_admission_policy"),
+        }
+        previous = None
+    if getattr(settings, "output_guard_enabled", False):
+        from finance_adapters.providers.output_guard import guard_agent_action
+
+        # Preflight the local dependency before any paid request is attempted.
+        preflight = guard_agent_action({}, {"type": "object", "properties": {},
+                                            "additionalProperties": False})
+        workflow_trace["output_guard_policy"] = {
+            "version": "guardrails_action_envelope_v1",
+            "backend_version": preflight["backend_version"],
+        }
     documents = _file_documents(session, filing, package.get("selected_document_ids"))
     for document in documents:
         materialized = retrieval.ensure_text_chunks(session, document.id)
@@ -3485,6 +3737,21 @@ def run_evidence_workflow(session: Session, filing: FilingVersion, package: dict
                                                      last_result, round_number,
                                                      single_action_policy=True, progress=progress)), "response_json": True,
                    "native_action_schema": _agent_action_schema(WORKFLOW_VERSION, progress)}
+        if current_support_policy():
+            request["system"] += _claim_support_system_suffix()
+        if _SOURCE_UNIT_ADMISSION_POLICY.get() == SOURCE_UNIT_ADMISSION_POLICY_V1:
+            request["system"] += SOURCE_UNIT_ADMISSION_SYSTEM_SUFFIX
+        profile_suffix = (
+            _claim_support_system_suffix()
+            + (SOURCE_UNIT_ADMISSION_SYSTEM_SUFFIX
+               if _SOURCE_UNIT_ADMISSION_POLICY.get() == SOURCE_UNIT_ADMISSION_POLICY_V1 else "")
+        )
+        profile_base = request["system"][:-len(profile_suffix)] if profile_suffix else request["system"]
+        registered_system, prompt_profile = new_prompt_profile(
+            profile_base, profile_suffix, task_policy=coverage_policy == OBLIGATION_TASK_POLICY_V1,
+        )
+        request["system"] = registered_system
+        workflow_trace["prompt_profile"] = prompt_profile
         round_trace = {"round": round_number, "started_at": _now(), "request": request,
                        "request_hash": stable_hash(request)}
         workflow_trace["rounds"].append(round_trace)
@@ -3493,6 +3760,12 @@ def run_evidence_workflow(session: Session, filing: FilingVersion, package: dict
             round_trace.update(raw_content=content, response_hash=stable_hash(content), provider_metadata=metadata)
             action_model = V10ActionEnvelope if WORKFLOW_VERSION in {V10_WORKFLOW_VERSION, V11_WORKFLOW_VERSION} else V9ActionEnvelope if WORKFLOW_VERSION == V9_WORKFLOW_VERSION else V7ActionEnvelope
             action = action_model.model_validate_json(content, strict=True)
+            if workflow_trace.get("output_guard_policy"):
+                from finance_adapters.providers.output_guard import guard_agent_action
+
+                round_trace["output_guard"] = guard_agent_action(
+                    json.loads(content), action_model.model_json_schema(),
+                )
             round_trace["action"] = action.model_dump(mode="json")
             visible_ids = set(progress["source_coverage"]["currently_visible_source_ids"])
             source_registry = (_round_source_registry(sources, snapshot, workflow_trace["rounds"],
@@ -3560,6 +3833,8 @@ def run_evidence_workflow(session: Session, filing: FilingVersion, package: dict
                 break
         except (ValueError, ValidationError) as exc:
             round_trace.update(status="rejected", error=str(exc), completed_at=_now())
+            if getattr(exc, "audit_metadata", {}).get("backend") == "guardrails-ai":
+                round_trace["output_guard"] = exc.audit_metadata
             if "candidate_dispositions" not in round_trace and "raw_content" in round_trace:
                 unexamined = _v7_unexamined_candidates(round_trace["raw_content"], round_number)
                 if unexamined is not None:
@@ -3632,17 +3907,35 @@ def run_evidence_workflow(session: Session, filing: FilingVersion, package: dict
         completed_rounds=len(workflow_trace["rounds"]), checkpoint_id=stable_hash(checkpoint),
         resumed_from_checkpoint=previous.get("checkpoint_id") if previous else None,
         limitations=WORKFLOW_LIMITATIONS, coverage_policy=workflow_trace["obligation_policy"],
-        obligation_tasks=task_states).model_dump(mode="json")
+        obligation_tasks=task_states, semantic_policy=current_support_policy(),
+        source_unit_admission_policy=_SOURCE_UNIT_ADMISSION_POLICY.get()).model_dump(mode="json")
     if coverage_policy in ROW_COVERAGE_POLICIES:
         result["evidence_coverage"] = _final_coverage_report(sources, findings, snapshot,
                                                            rounds=workflow_trace["rounds"], previous=previous,
                                                            row_context_policy=ROW_CONTEXT_POLICY_V2)
     validate_workflow_result(result, package)
+    if getattr(settings, "semantic_graph_enabled", False):
+        from finance_adapters.providers.semantic_graph import build_semantic_evidence_graph
+
+        # These are sidecar provenance graphs, never inputs to fact admission,
+        # calculations, model prompts, or the saved financial result hash.
+        workflow_trace["semantic_evidence_graphs"] = [
+            build_semantic_evidence_graph(
+                issuer_id=document["company_id"],
+                filing_version_id=document["filing_version_id"],
+                source_sha256=document["source_sha256"],
+                sources=[source for source in result["sources"]
+                         if source["filing_version_id"] == document["filing_version_id"]],
+                findings=result["findings"],
+            ) for document in snapshot
+        ]
     workflow_trace.update(status=status, stop_reason=stop_reason, completed_at=_now(),
                           result_hash=stable_hash(result), result=result)
     return result
 
 
+@source_unit_admission_policy_scope(lambda value, package: value.get("source_unit_admission_policy"))
+@support_policy_scope(lambda value, package: value.get("semantic_policy"))
 def validate_workflow_result(value: dict, package: dict) -> None:
     """Validate frozen evidence without a DB, remote service, or model call."""
     result = AgentWorkflowResult.model_validate(value)
@@ -3848,11 +4141,20 @@ def current_workflow_snapshot(session: Session, filing: FilingVersion) -> list[d
     return _document_snapshot(session, _file_documents(session, filing))
 
 
+@source_unit_admission_policy_scope(lambda trace, package, check_provider=None: (trace.get("agent") or {}).get("source_unit_admission_policy"))
+@support_policy_scope(lambda trace, package, check_provider=None: (trace.get("agent") or {}).get("semantic_policy"))
 def replay_evidence_workflow(trace: dict, package: dict, check_provider=None) -> dict:
     """Rebuild the saved loop from immutable tool results; never rerun a search."""
     agent = trace.get("agent")
     if not agent or agent.get("status") == "unavailable":
         return {"status": "not_available", "model_called": False}
+    guard_policy = agent.get("output_guard_policy")
+    if guard_policy is not None:
+        from importlib.metadata import version as dependency_version
+
+        if (guard_policy.get("version") != "guardrails_action_envelope_v1"
+                or guard_policy.get("backend_version") != dependency_version("guardrails-ai")):
+            raise ValueError("REPLAY_AGENT_OUTPUT_GUARD_POLICY_MISMATCH")
     coverage_policy = agent.get("obligation_policy")
     row_context_policy = agent.get("row_context_policy")
     if row_context_policy is not None and (
@@ -4020,6 +4322,20 @@ def replay_evidence_workflow(trace: dict, package: dict, check_provider=None) ->
                          else OBLIGATION_V3_AGENT_SYSTEM_PROMPT if coverage_policy == OBLIGATION_COVERAGE_POLICY_V3
                          else OBLIGATION_V2_AGENT_SYSTEM_PROMPT if coverage_policy == OBLIGATION_COVERAGE_POLICY_V2
                          else AGENT_SYSTEM_PROMPT)
+        if current_support_policy():
+            system_prompt += _claim_support_system_suffix()
+        if _SOURCE_UNIT_ADMISSION_POLICY.get() == SOURCE_UNIT_ADMISSION_POLICY_V1:
+            system_prompt += SOURCE_UNIT_ADMISSION_SYSTEM_SUFFIX
+        profile_suffix = (
+            _claim_support_system_suffix()
+            + (SOURCE_UNIT_ADMISSION_SYSTEM_SUFFIX
+               if _SOURCE_UNIT_ADMISSION_POLICY.get() == SOURCE_UNIT_ADMISSION_POLICY_V1 else "")
+        )
+        profile_base = system_prompt[:-len(profile_suffix)] if profile_suffix else system_prompt
+        system_prompt = replay_prompt(
+            profile_base, profile_suffix, request.get("system") if isinstance(request, dict) else None,
+            agent.get("prompt_profile"), task_policy=coverage_policy == OBLIGATION_TASK_POLICY_V1,
+        )
         action_model = V10ActionEnvelope if agent["version"] in {V10_WORKFLOW_VERSION, V11_WORKFLOW_VERSION} else V9ActionEnvelope if agent["version"] == V9_WORKFLOW_VERSION else V7ActionEnvelope if agent["version"] in INDIVIDUAL_CANDIDATE_WORKFLOW_VERSIONS else _action_model(agent["version"])
         progress = (_workflow_progress(tools[:tool_index], rounds[:index - 1], sources, findings,
                                        requirements, index, agent["max_rounds"],
@@ -4036,6 +4352,9 @@ def replay_evidence_workflow(trace: dict, package: dict, check_provider=None) ->
                                            requirements, last_result, index, version=agent["version"],
                                            single_action_policy=single_action_policy, progress=progress)
         if request.get("user") != json_text(expected_payload) or request.get("response_json") is not True:
+            if (coverage_policy == OBLIGATION_TASK_POLICY_V1
+                    and is_registered_legacy_task_prompt(system_prompt, profile_suffix)):
+                raise ValueError("REPLAY_AGENT_LEGACY_PAYLOAD_PROFILE_UNAVAILABLE")
             raise ValueError("REPLAY_AGENT_REQUEST_STATE_MISMATCH")
         if "response_schema" in request and request["response_schema"] != action_schema:
             raise ValueError("REPLAY_AGENT_SCHEMA_MISMATCH")
@@ -4089,7 +4408,20 @@ def replay_evidence_workflow(trace: dict, package: dict, check_provider=None) ->
             action = action_model.model_validate_json(
                 step.get("raw_content", ""), strict=agent["version"] != LEGACY_WORKFLOW_VERSION,
             )
+            if guard_policy is not None:
+                from finance_adapters.providers.output_guard import guard_agent_action
+
+                guard_receipt = guard_agent_action(
+                    json.loads(step["raw_content"]), action_model.model_json_schema(),
+                )
+                if guard_receipt != step.get("output_guard"):
+                    raise ValueError("REPLAY_AGENT_OUTPUT_GUARD_RECEIPT_MISMATCH")
+            elif "output_guard" in step:
+                raise ValueError("REPLAY_AGENT_OUTPUT_GUARD_POLICY_MISSING")
         except (ValidationError, ValueError) as exc:
+            if (getattr(exc, "audit_metadata", {}).get("backend") == "guardrails-ai"
+                    and step.get("output_guard") != exc.audit_metadata):
+                raise ValueError("REPLAY_AGENT_OUTPUT_GUARD_RECEIPT_MISMATCH") from exc
             if status != "rejected" or step.get("error") != str(exc):
                 raise ValueError("REPLAY_AGENT_ACTION_MISMATCH") from exc
             if agent["version"] in INDIVIDUAL_CANDIDATE_WORKFLOW_VERSIONS and step.get("candidate_dispositions") != _v7_unexamined_candidates(
@@ -4334,7 +4666,8 @@ def replay_evidence_workflow(trace: dict, package: dict, check_provider=None) ->
             completed_rounds=len(rounds), checkpoint_id=stable_hash(checkpoint),
             resumed_from_checkpoint=previous_result.get("checkpoint_id") if previous_result else None,
             limitations=WORKFLOW_LIMITATIONS, coverage_policy=coverage_policy,
-            obligation_tasks=task_states),
+            obligation_tasks=task_states, semantic_policy=current_support_policy(),
+            source_unit_admission_policy=_SOURCE_UNIT_ADMISSION_POLICY.get()),
         version=agent["version"],
     )
     if coverage_policy in ROW_COVERAGE_POLICIES:
@@ -4359,5 +4692,17 @@ def replay_evidence_workflow(trace: dict, package: dict, check_provider=None) ->
     validate_workflow_result(result, package)
     if stable_hash(result) != agent.get("result_hash") or trace.get("agent_workflow") != result:
         raise ValueError("REPLAY_AGENT_RESULT_MISMATCH")
+    if "semantic_evidence_graphs" in agent:
+        from finance_adapters.providers.semantic_graph import build_semantic_evidence_graph
+
+        graphs = [build_semantic_evidence_graph(
+            issuer_id=document["company_id"], filing_version_id=document["filing_version_id"],
+            source_sha256=document["source_sha256"],
+            sources=[source for source in result["sources"]
+                     if source["filing_version_id"] == document["filing_version_id"]],
+            findings=result["findings"],
+        ) for document in snapshot]
+        if graphs != agent["semantic_evidence_graphs"]:
+            raise ValueError("REPLAY_AGENT_SEMANTIC_GRAPH_MISMATCH")
     return {"status": "passed", "model_called": False, "rounds": len(rounds),
             "tool_calls": len(tools), "result_hash": stable_hash(result)}

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 from sqlalchemy import (
@@ -46,6 +46,9 @@ class FilingVersion(Base):
     file_sha256: Mapped[str] = mapped_column(String(64), unique=True)
     object_key: Mapped[str] = mapped_column(String(500))
     status: Mapped[str] = mapped_column(String(32), default="uploaded")
+    # Existing filings retain their historical admission contract. Selecting an
+    # automatic policy is explicit and must never fabricate legacy approvals.
+    fact_validation_policy: Mapped[str] = mapped_column(String(64), default="legacy_manual_v1")
     supersedes_filing_version_id: Mapped[int | None] = mapped_column(
         ForeignKey("filing_versions.id"), nullable=True
     )
@@ -152,6 +155,22 @@ class FinancialFact(Base):
     raw_value: Mapped[str] = mapped_column(String(256))
     comparative_period: Mapped[bool] = mapped_column(default=False)
     is_restatement: Mapped[bool] = mapped_column(default=False)
+
+
+class FactAutoValidationRun(Base):
+    """Versioned source-bound receipts; product admission uses no reviewer rows."""
+
+    __tablename__ = "fact_auto_validation_runs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    filing_version_id: Mapped[int] = mapped_column(ForeignKey("filing_versions.id"), index=True)
+    extraction_job_id: Mapped[int] = mapped_column(ForeignKey("extraction_jobs.id"))
+    policy_version: Mapped[str] = mapped_column(String(64))
+    source_sha256: Mapped[str] = mapped_column(String(64))
+    input_snapshot_hash: Mapped[str] = mapped_column(String(64))
+    output_hash: Mapped[str] = mapped_column(String(64))
+    input_snapshot: Mapped[dict] = mapped_column(JSON)
+    receipt: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
 
 
 class Concept(Base):

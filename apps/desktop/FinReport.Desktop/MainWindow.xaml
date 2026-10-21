@@ -65,7 +65,7 @@
                                 <ComboBoxItem Style="{StaticResource ComboItem}" Content="方案1：直接 PDF 提取" Tag="pdf_text"/>
                                 <ComboBoxItem Style="{StaticResource ComboItem}" Content="方案2：OCR 识别" Tag="ocr"/>
                             </ComboBox>
-                            <TextBlock Style="{StaticResource FieldHint}" Text="方案1读取 PDF 文字与位置，适合含文字层的正规财报；方案2识别页面图像，适合扫描件。两种方案提取后均须人工审核，再计算指标与分析。" TextWrapping="Wrap"/>
+                            <TextBlock Style="{StaticResource FieldHint}" Text="方案1读取 PDF 文字与位置；方案2识别页面图像。新章节流程仅使用自动校验通过的事实作严格计算；选页和 OCR 尚未获自动准入时保留候选与缺口。旧复核入口保留历史兼容。" TextWrapping="Wrap"/>
                             <TextBlock Style="{StaticResource FieldHint}" Text="{Binding ExtractionMethodHint}" TextWrapping="Wrap" Margin="0,5,0,0"/>
                             <TextBlock Style="{StaticResource FieldLabel}" Text="处理页码（PDF 原始页码）" Margin="0,12,0,0"/>
                             <TextBox Style="{StaticResource InputField}" Text="{Binding SelectedPageNumbers, UpdateSourceTrigger=PropertyChanged}" ToolTip="例如：2,7-9,11；选页后只处理这些原始 PDF 页。"/>
@@ -129,9 +129,15 @@
 <Expander Header="所选候选的原文证据"><TextBox Text="{Binding SelectedReportMeasure.Evidence, Mode=OneWay}" IsReadOnly="True" MaxHeight="240" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"/></Expander>
 <Expander Header="服务端计算与缺失项" Margin="0,8"><TextBox Text="{Binding ReportCalculations, Mode=OneWay}" IsReadOnly="True" MaxHeight="300" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"/></Expander>
 <Separator Margin="0,14"/>
-<TextBlock Text="独立分析仅使用当前报告。联合分析需显式填写报告 ID（包含上方当前报告 ID），未选择的报告不参与。待审核来源会继续标记待复核。" TextWrapping="Wrap"/>
+<TextBlock Text="独立分析仅使用当前报告。联合分析需显式填写报告 ID（包含当前报告 ID）。章节流程允许在所选材料内跨章取证，不要求人员审核；未自动通过的事实不能用于严格计算。上方复核区供旧流程兼容。" TextWrapping="Wrap"/>
+<CheckBox Content="使用章节分析、跨章取证与逐条核验流程（旧流程仍可选择）" IsChecked="{Binding UseChapterWorkflow}" Margin="0,8"/>
+<Button Content="执行原生事实自动校验（整份提取）" Command="{Binding ValidateNativeFactsCommand}" HorizontalAlignment="Left"/>
+<Expander Header="自动校验状态与准入缺口"><TextBox Text="{Binding AutomaticValidationSummary, Mode=OneWay}" IsReadOnly="True" MaxHeight="240" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"/></Expander>
 <WrapPanel Margin="0,10"><Button Content="独立分析当前报告" Command="{Binding StartIndependentReportAnalysisCommand}" Margin="0,0,14,0"/><TextBlock Text="联合报告 ID" VerticalAlignment="Center"/><TextBox Width="220" Margin="8,0,12,0" Text="{Binding JointReportDocumentIds, UpdateSourceTrigger=PropertyChanged}" ToolTip="例如：12,13,14,15；必须包含当前报告 ID。"/><Button Content="分析显式选择的报告" Command="{Binding StartJointReportAnalysisCommand}"/></WrapPanel>
+<Expander Header="章节工作流分级日志" IsExpanded="True"><StackPanel><WrapPanel><TextBlock Text="最低级别" VerticalAlignment="Center"/><ComboBox Width="130" ItemsSource="{Binding ReportLogLevels}" SelectedItem="{Binding ReportLogLevel}" Margin="8"/><Button Content="按级别重新读取" Command="{Binding RefreshChapterLogCommand}" Margin="8"/><Button Content="请求取消章节任务" Command="{Binding CancelChapterAnalysisCommand}" Margin="8"/></WrapPanel><TextBox Text="{Binding ReportWorkflowLog, Mode=OneWay}" IsReadOnly="True" MaxHeight="350" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"/></StackPanel></Expander>
 <Expander Header="报告试验分析结果" IsExpanded="True"><TextBox Text="{Binding ReportAnalysisSummary, Mode=OneWay}" IsReadOnly="True" MaxHeight="400" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"/></Expander>
+<Button Content="读取通过发布检查的 Markdown 报告" Command="{Binding LoadValidatedChapterReportCommand}" HorizontalAlignment="Left" Margin="0,8"/>
+<Expander Header="已核验判断与逐条证据"><TextBox Text="{Binding ValidatedChapterReport, Mode=OneWay}" IsReadOnly="True" MaxHeight="450" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"/></Expander>
 <Expander x:Name="ProviderReasoningExpander" Header="供应商返回的思考文本" Margin="0,8"><StackPanel><TextBlock Text="显示供应商实际返回的文本；不能据此核验完整内部推理或财务结论。" TextWrapping="Wrap"/><TextBox Text="{Binding ReportReasoningSummary, Mode=OneWay}" IsReadOnly="True" MaxHeight="400" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"/></StackPanel></Expander>
 <WrapPanel Margin="0,10"><Button Content="本地重放核验（不请求模型）" Command="{Binding ReplayReportAnalysisCommand}"/></WrapPanel>
 <Expander Header="本地重放结果"><TextBox Text="{Binding ReportReplaySummary, Mode=OneWay}" IsReadOnly="True" MaxHeight="300" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"/></Expander>

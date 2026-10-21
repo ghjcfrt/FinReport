@@ -12,6 +12,12 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
+from finance_adapters.providers.run_journal import (
+    JournalPersistenceError,
+    journal_stream_event,
+    start_model_call,
+)
+
 
 class BaiduUnlimitedOCRAdapter:
     """Build and normalize the two supported Unlimited-OCR wire protocols.
@@ -119,8 +125,13 @@ class ModelConfig:
     poll_interval: float = 5.0
     stream: bool = False
     provider_sort: str | None = None
+    schema_builder: str = "native"
 
     def __post_init__(self) -> None:
+        if self.schema_builder not in {"native", "outlines"}:
+            raise ValueError("MODEL_INVALID_SCHEMA_BUILDER")
+        if self.schema_builder == "outlines" and self.provider == "anthropic":
+            raise ValueError("MODEL_SCHEMA_BUILDER_UNSUPPORTED_PROVIDER")
         if not math.isfinite(self.timeout) or self.timeout <= 0:
             raise ValueError("MODEL_INVALID_TIMEOUT")
         if not math.isfinite(self.poll_interval) or self.poll_interval < 0:
@@ -153,6 +164,13 @@ class ModelClient:
 
     def __init__(self, config: ModelConfig):
         self.config = config
+        if config.schema_builder == "outlines":
+            from finance_adapters.providers.output_guard import outlines_response_format
+
+            # A missing/broken optional SDK must fail before the evidence loop
+            # can make paid native-tool requests and reach final synthesis.
+            outlines_response_format({"type": "object", "properties": {},
+                                      "additionalProperties": False})
         self._ocr_access_token = ""
         self._ocr_token_expires_at = 0.0
         self._known_secrets = {value for value in (config.api_key, config.secret_key) if value}
@@ -328,6 +346,7 @@ class ModelClient:
             event_lines = []
             if wire == "[DONE]":
                 events.append({"event": event_name, "id": event_id, "data": "[DONE]", "data_encoding": "sentinel"})
+                journal_stream_event(events[-1])
                 metadata["stream_done"] = True
                 event_name, event_id = "message", None
                 return
@@ -336,9 +355,11 @@ class ModelClient:
             except ValueError as exc:
                 events.append({"event": event_name, "id": event_id, "data": self._sanitize(wire),
                                "data_encoding": "raw"})
+                journal_stream_event(events[-1])
                 raise ModelRequestError("MODEL_INVALID_STREAM_JSON", {}) from exc
             events.append(self._sanitize({"event": event_name, "id": event_id, "data": chunk,
                                           "data_encoding": "json"}))
+            journal_stream_event(events[-1])
             is_error = event_name == "error"
             event_name, event_id = "message", None
             if metadata["stream_done"] or not isinstance(chunk, dict):
@@ -412,6 +433,7 @@ class ModelClient:
                     consume()
                 elif line.startswith(":"):
                     events.append({"comment": self._sanitize(line[1:])})
+                    journal_stream_event(events[-1])
                 else:
                     field, _, value = line.partition(":")
                     value = value.removeprefix(" ")
@@ -446,10 +468,16 @@ class ModelClient:
             "response": None, "response_sha256": None, "status_code": None,
             "usage": None, "reasoning_output": [], "hash_basis": "canonical_sanitized_json",
         }
+        journal_call = start_model_call(metadata, self._known_secrets)
+        journal_error: str | None = None
         try:
             with httpx.Client(timeout=self.config.timeout) as client:
                 if payload.get("stream") is True:
+                    if journal_call:
+                        journal_call.dispatch()
                     with client.stream("POST", url, headers=headers, json=payload) as response:
+                        if journal_call:
+                            journal_call.response_received(response.status_code, dict(response.headers))
                         metadata["status_code"] = response.status_code
                         metadata["response_headers"] = self._sanitize(dict(response.headers))
                         if response.is_success and "text/event-stream" in response.headers.get("content-type", ""):
@@ -470,23 +498,73 @@ class ModelClient:
                             if response.is_success and not finish and not (isinstance(data, dict) and data.get("error")):
                                 raise ModelRequestError("MODEL_STREAM_INCOMPLETE", {})
                 else:
+                    if journal_call:
+                        journal_call.dispatch()
                     response = client.post(url, headers=headers, json=payload)
+                    if journal_call:
+                        journal_call.response_received(getattr(response, "status_code", None),
+                                                       dict(getattr(response, "headers", {})))
                     data = self._json_response(response, metadata)
+            if journal_call:
+                journal_call.persist_response(metadata.get("response", data),
+                                              stream_complete=metadata.get("stream_complete"),
+                                              stream_transport=metadata.get("stream_transport"))
             if not isinstance(data, dict):
                 raise ModelRequestError("MODEL_INVALID_RESPONSE", metadata)
             content, normalized = self._response(data, native_action_schema=native_action_schema)
             metadata.update(normalized)
+            if journal_call:
+                content = journal_call.journal.sanitize(content)
             return content, metadata
         except ModelRequestError as exc:
+            journal_error = str(exc)
             metadata.update(exc.metadata)
             metadata["error"] = {"type": type(exc).__name__, "code": str(exc)}
+            if journal_call:
+                raise ModelRequestError(journal_call.journal.sanitize(str(exc)), metadata) from None
             raise ModelRequestError(str(exc), metadata) from exc
         except Exception as exc:
             code = "MODEL_REQUEST_TIMEOUT" if isinstance(exc, httpx.TimeoutException) else "MODEL_REQUEST_FAILED"
+            if isinstance(exc, JournalPersistenceError):
+                code = str(exc)
+            if journal_call:
+                metadata["failure_phase"] = (
+                    "connection_timeout" if isinstance(exc, httpx.ConnectTimeout) else
+                    "stream_idle_timeout" if isinstance(exc, httpx.ReadTimeout) and journal_call.received else
+                    "response_header_timeout" if isinstance(exc, httpx.ReadTimeout) else
+                    "write_timeout" if isinstance(exc, httpx.WriteTimeout) else
+                    "pool_timeout" if isinstance(exc, httpx.PoolTimeout) else
+                    "connection_interrupted" if isinstance(exc, httpx.TransportError) else
+                    "local_or_protocol_failure")
+            journal_error = code
             metadata["error"] = {"type": type(exc).__name__, "code": code}
+            if journal_call:
+                raise ModelRequestError(code, metadata) from None
             raise ModelRequestError(code, metadata) from exc
         finally:
             metadata["duration_seconds"] = round(time.perf_counter() - started, 6)
+            if journal_call:
+                # Incomplete streams and protocol errors are retained as
+                # fragments, never promoted to a complete response. A complete
+                # HTTP error body can still be persisted before being rejected.
+                try:
+                    safe_metadata = journal_call.journal.sanitize(metadata)
+                    metadata.clear()
+                    metadata.update(safe_metadata)
+                    # Scoped sanitization also removes signed-URL credentials
+                    # from provider text. Hash the final exposed representation,
+                    # rather than retaining a hash of its less-filtered parent.
+                    for field in ("request", "response", "stream_events"):
+                        if metadata.get(field) is not None:
+                            metadata[field + "_sha256"] = self._hash(metadata[field])
+                    if (not journal_call.persisted and metadata.get("response") is not None
+                            and not (payload.get("stream") is True
+                                     and metadata.get("stream_complete") is not True)):
+                        journal_call.persist_response(metadata["response"],
+                                                      status_code=metadata.get("status_code"))
+                    journal_call.finish(metadata, journal_error)
+                finally:
+                    journal_call.close()
 
     def _json_response(self, response: httpx.Response, metadata: dict[str, Any]) -> Any:
         metadata["status_code"] = getattr(response, "status_code", None)
@@ -536,9 +614,19 @@ class ModelClient:
                 payload["tool_choice"] = {"type": "function", "function": {"name": self.ACTION_TOOL_NAME}}
                 payload["parallel_tool_calls"] = False
             elif response_schema is not None:
-                payload["response_format"] = {"type": "json_schema", "json_schema": {
-                    "name": "finreport_analysis", "strict": True, "schema": self._strict_schema(response_schema),
-                }}
+                if self.config.schema_builder == "outlines":
+                    from finance_adapters.providers.output_guard import outlines_response_format
+
+                    payload.update(outlines_response_format(self._strict_schema(response_schema)))
+                    # Keep the stable wire name used by historical provider
+                    # replay; Outlines' adapter defaults to the name 'default'.
+                    payload["response_format"]["json_schema"]["name"] = "finreport_analysis"
+                elif self.config.schema_builder == "native":
+                    payload["response_format"] = {"type": "json_schema", "json_schema": {
+                        "name": "finreport_analysis", "strict": True, "schema": self._strict_schema(response_schema),
+                    }}
+                else:
+                    raise ValueError("MODEL_INVALID_SCHEMA_BUILDER")
             elif response_json:
                 payload["response_format"] = {"type": "json_object"}
             if self.config.enable_thinking is not None:
@@ -554,7 +642,15 @@ class ModelClient:
             url = self.config.base_url.rstrip("/") + "/chat/completions"
         if native_action_schema is not None:
             return self._request(url, headers, payload, native_action_schema=native_action_schema)
-        return self._request(url, headers, payload)
+        content, metadata = self._request(url, headers, payload)
+        if response_schema is not None and self.config.schema_builder == "outlines" and self.config.provider != "anthropic":
+            from importlib.metadata import version
+
+            metadata["structured_output_builder"] = {
+                "backend": "outlines", "backend_version": version("outlines"),
+                "local_constrained_decoding": False,
+            }
+        return content, metadata
 
     def _ocr_protocol(self) -> str:
         return BaiduUnlimitedOCRAdapter.resolve_protocol(self.config.base_url, self.config.protocol)

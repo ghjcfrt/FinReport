@@ -18,6 +18,7 @@ from finance_adapters.persistence.report_measure_gateway import (
     report_measure_context,
     validate_measure_bundle,
 )
+from finance_adapters.providers import evidence_retrieval as retrieval
 from finance_adapters.providers.document_context import build_document_context
 from finance_adapters.providers.model_clients import ModelClient, ModelConfig
 
@@ -90,9 +91,18 @@ def build_report_package(session: Session, filing_id: int,
 
 def create_report_analysis(session: Session, filing_id: int,
                             selected_document_ids: list[int] | None = None) -> AnalysisRun:
+    # Authorize the full selection before touching its retrieval corpus.  A
+    # service fallback may replace old Docling chunks with native PDF chunks;
+    # do that before the new run exists, not after it becomes running.
     package = build_report_package(session, filing_id, selected_document_ids)
+    for document_id in package["selected_document_ids"]:
+        retrieval.materialize_document_text_chunks(session, document_id)
+    package = build_report_package(session, filing_id, selected_document_ids)
+    text_snapshot = retrieval.snapshot(session, package["selected_document_ids"])
     trace = {"version": REPORT_ANALYSIS_VERSION, "input_snapshot": package,
              "input_snapshot_hash": stable_hash(package), "selection_mode": package["selection_mode"],
+             "retrieval_input_snapshot": text_snapshot,
+             "retrieval_input_snapshot_hash": stable_hash(text_snapshot),
              "started_at": datetime.now(UTC).isoformat()}
     run = AnalysisRun(filing_version_id=filing_id, input_snapshot_hash=stable_hash(package),
                       orchestration_version=REPORT_ANALYSIS_VERSION, prompt_version=REPORT_ANALYSIS_VERSION,
@@ -107,6 +117,16 @@ def create_report_analysis(session: Session, filing_id: int,
                                "selection_mode": package["selection_mode"]})
     session.commit()
     return run
+
+
+def _validate_text_snapshot(session: Session, trace: dict, document_ids: list[int]) -> None:
+    expected = trace.get("retrieval_input_snapshot")
+    if not isinstance(expected, dict):
+        raise ValueError("REPORT_ANALYSIS_TEXT_SNAPSHOT_REQUIRED")  # noqa: TRY004 - persisted run state
+    if stable_hash(expected) != trace.get("retrieval_input_snapshot_hash"):
+        raise ValueError("REPORT_ANALYSIS_TEXT_SNAPSHOT_HASH_MISMATCH")
+    if retrieval.snapshot(session, document_ids) != expected:
+        raise ValueError("REPORT_ANALYSIS_TEXT_SNAPSHOT_CHANGED")
 
 
 def run_report_analysis(session: Session, run_id: int) -> None:
@@ -133,6 +153,7 @@ def run_report_analysis(session: Session, run_id: int) -> None:
         explicit = package["selected_document_ids"] if package["selection_mode"] == "explicit_joint" else None
         if build_report_package(session, run.filing_version_id, explicit) != package:
             raise ValueError("REPORT_ANALYSIS_INPUT_CHANGED")
+        _validate_text_snapshot(session, trace, package["selected_document_ids"])
         validate_measure_bundle(package["report_measure_bundle"])
         if not settings.llm_base_url or not settings.llm_api_key or not settings.llm_model:
             raise ValueError("LLM_CONFIGURATION_REQUIRED")
@@ -148,6 +169,14 @@ def run_report_analysis(session: Session, run_id: int) -> None:
             run.tool_trace = deepcopy(trace)
             run.tool_trace_hash = stable_hash(trace)
             session.commit()
+            # The workflow calls this after materialization and bootstrap,
+            # before its first model request, and again after each round.
+            # Preserve any invalidation/audit records before stopping; never
+            # clear invalidated_at to publish a result against new sources.
+            session.refresh(run)
+            if run.invalidated_at is not None:
+                raise ValueError("REPORT_ANALYSIS_SOURCE_REVIEW_CHANGED")
+            _validate_text_snapshot(session, trace, package["selected_document_ids"])
 
         filing = session.get(FilingVersion, run.filing_version_id)
         workflow = run_evidence_workflow(session, filing, package, client, trace,
@@ -157,6 +186,7 @@ def run_report_analysis(session: Session, run_id: int) -> None:
         session.refresh(run)
         if run.invalidated_at is not None:
             raise ValueError("REPORT_ANALYSIS_SOURCE_REVIEW_CHANGED")
+        _validate_text_snapshot(session, trace, package["selected_document_ids"])
         if build_report_package(session, run.filing_version_id, explicit) != package:
             raise ValueError("REPORT_ANALYSIS_INPUT_CHANGED_DURING_RUN")
         trace["agent_workflow"] = workflow

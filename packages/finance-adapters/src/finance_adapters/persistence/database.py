@@ -23,7 +23,10 @@ def init_database() -> None:
     # so local runs remain recoverable without rewriting existing user data.
     additions = {
         "companies": {"business_model_tags": "JSON"},
-        "filing_versions": {"source_priority": "INTEGER DEFAULT 3"},
+        "filing_versions": {
+            "source_priority": "INTEGER DEFAULT 3",
+            "fact_validation_policy": "VARCHAR(64) DEFAULT 'legacy_manual_v1'",
+        },
         "extraction_jobs": {
             "retry_count": "INTEGER DEFAULT 0", "queued_at": "DATETIME",
             "owner_token": "VARCHAR(64)", "lease_expires_at": "DATETIME",

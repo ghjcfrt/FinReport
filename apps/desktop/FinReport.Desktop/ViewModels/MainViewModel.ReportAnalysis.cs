@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using System.Globalization;
+using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using CommunityToolkit.Mvvm.ComponentModel;
@@ -19,6 +20,14 @@ public partial class MainViewModel
     [ObservableProperty] private string reportAnalysisSummary = "报告试验分析：尚未启动。";
     [ObservableProperty] private string reportReplaySummary = "本地重放：尚未执行。";
     [ObservableProperty] private string reportReasoningSummary = "供应商思考文本：尚无已保存的模型调用。";
+    [ObservableProperty] private bool useChapterWorkflow = true;
+    [ObservableProperty] private string reportLogLevel = "INFO";
+    [ObservableProperty] private string reportWorkflowLog = "章节任务日志：尚未启动。完整记录保存在服务端本地运行目录。";
+    public string[] ReportLogLevels { get; } = ["TRACE", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"];
+    private bool _activeReportChapter;
+    private long _reportEventCursor;
+    private long _reportLogRunId;
+    private readonly SemaphoreSlim _chapterLogGate = new(1, 1);
     public ObservableCollection<ReportMeasureRow> ReportMeasures { get; } = [];
     private long _reportDataFilingId;
     private long _reportAnalysisRunId;
@@ -60,6 +69,8 @@ public partial class MainViewModel
         ReportAnalysisSummary = "报告试验分析：尚未启动。";
         ReportReplaySummary = "本地重放：尚未执行。";
         ReportReasoningSummary = "供应商思考文本：尚无已保存的模型调用。";
+        ReportWorkflowLog = "章节任务日志：尚未启动。";
+        _reportEventCursor = 0;
     }
 
     [RelayCommand]
@@ -119,6 +130,8 @@ public partial class MainViewModel
         if (IsBusy || _filingId == 0) return;
         IsBusy = true;
         ErrorMessage = "";
+        long startedRunId = 0;
+        string? observedTerminalStatus = null;
         try
         {
             long[]? ids = null;
@@ -133,20 +146,52 @@ public partial class MainViewModel
             }
             using var cancellation = new CancellationTokenSource(TimeSpan.FromMinutes(30));
             ReportReasoningSummary = "供应商思考文本：等待本次模型调用。";
-            _reportAnalysisRunId = await api.StartReportAnalysisAsync(_filingId, ids, cancellation.Token);
+            _activeReportChapter = UseChapterWorkflow;
+            _reportEventCursor = 0;
+            ReportWorkflowLog = "";
+            _reportAnalysisRunId = 0;
+            _reportAnalysisRunId = _activeReportChapter
+                ? await api.StartChapterAnalysisAsync(_filingId, ids, cancellation.Token)
+                : await api.StartReportAnalysisAsync(_filingId, ids, cancellation.Token);
+            startedRunId = _reportAnalysisRunId;
             while (true)
             {
-                var run = await api.GetReportAnalysisAsync(_reportAnalysisRunId, cancellation.Token);
+                var run = _activeReportChapter
+                    ? await api.GetChapterAnalysisAsync(_reportAnalysisRunId, cancellation.Token)
+                    : await api.GetReportAnalysisAsync(_reportAnalysisRunId, cancellation.Token);
+                var terminal = run.Status is "completed" or "invalidated" or "partial_result"
+                    or "waiting_for_documents" or "cancelled" or "failed";
+                if (terminal) observedTerminalStatus = run.Status;
+                var semanticLinkSummary = run.SemanticLinkSummary is JsonElement summary
+                    ? JsonSerializer.Serialize(summary, new JsonSerializerOptions { WriteIndented = true })
+                    : "子命题关联状态：接口未返回摘要。";
                 ReportAnalysisSummary = $"报告分析任务 {_reportAnalysisRunId} · {(joint ? "显式联合" : "当前报告独立")} · {run.Status}\n"
+                    + $"子命题关联状态：\n{semanticLinkSummary}\n"
                     + (run.Output is JsonElement output ? JsonSerializer.Serialize(output, new JsonSerializerOptions { WriteIndented = true }) : "");
                 ReportReasoningSummary = FormatProviderReasoning(run.ProviderReasoning);
-                if (run.Status is "completed" or "invalidated" or "partial_result" or "waiting_for_documents") break;
+                if (_activeReportChapter)
+                    await LoadChapterEventsAsync(cancellation.Token, drain: terminal);
                 if (run.Status == "failed") throw new InvalidOperationException(run.FailureReason ?? "报告分析失败。");
+                if (terminal) break;
                 await Task.Delay(1000, cancellation.Token);
             }
             ReportReplaySummary = "可执行本地重放核验保存的输入、计算与模型响应；不会再次请求模型。";
         }
-        catch (Exception ex) { ErrorMessage = ex.Message; }
+        catch (OperationCanceledException)
+        {
+            ErrorMessage = observedTerminalStatus is not null
+                ? $"任务 {startedRunId} 的服务端状态为 {observedTerminalStatus}，本地后续读取超时；可重新读取日志。"
+                : startedRunId > 0
+                    ? $"本地等待已超时。任务 {startedRunId} 未被自动取消，仍可能在服务端运行；请查看日志或请求取消，勿重复启动。"
+                    : "本地请求超时，尚未确认服务端是否创建任务；请先查询任务记录，避免重复启动。";
+            ReportReplaySummary = "本地等待超时不代表任务结束；尚未执行本地重放。";
+        }
+        catch (Exception ex)
+        {
+            ErrorMessage = ex.Message;
+            if (startedRunId > 0 && observedTerminalStatus is null)
+                ErrorMessage += $"\n本地查看已中断，任务 {startedRunId} 的服务端终态尚未确认；可继续查看日志或请求取消。";
+        }
         finally { IsBusy = false; }
     }
 
@@ -173,11 +218,80 @@ public partial class MainViewModel
         IsBusy = true;
         try
         {
-            var replay = await api.ReplayReportAnalysisAsync(_reportAnalysisRunId, CancellationToken.None);
+            var replay = _activeReportChapter
+                ? await api.ReplayChapterAnalysisAsync(_reportAnalysisRunId, CancellationToken.None)
+                : await api.ReplayReportAnalysisAsync(_reportAnalysisRunId, CancellationToken.None);
             ReportReplaySummary = JsonSerializer.Serialize(replay, new JsonSerializerOptions { WriteIndented = true });
         }
         catch (Exception ex) { ErrorMessage = $"本地重放失败：{ex.Message}"; }
         finally { IsBusy = false; }
+    }
+
+    private async Task LoadChapterEventsAsync(CancellationToken cancellationToken,
+        bool reset = false, bool drain = false)
+    {
+        await _chapterLogGate.WaitAsync(cancellationToken);
+        try
+        {
+            var runId = _reportAnalysisRunId;
+            if (!_activeReportChapter || runId == 0) return;
+            if (reset || _reportLogRunId != runId)
+            {
+                _reportEventCursor = 0;
+                _reportLogRunId = runId;
+                ReportWorkflowLog = "";
+            }
+            var level = ReportLogLevel;
+            long? snapshotEnd = null;
+            var pages = 0;
+            while (true)
+            {
+                var previousCursor = _reportEventCursor;
+                var page = await api.GetChapterEventsAsync(runId, previousCursor, level, cancellationToken);
+                // Do not append an old run's response after a new task has started.
+                if (_reportAnalysisRunId != runId || !_activeReportChapter) return;
+                if (page.TryGetProperty("latest_sequence", out var latest))
+                    snapshotEnd ??= latest.GetInt64();
+                var lines = new StringBuilder();
+                if (page.TryGetProperty("events", out var events))
+                    foreach (var entry in events.EnumerateArray())
+                        lines.AppendLine(JsonSerializer.Serialize(entry));
+                ReportWorkflowLog += lines.ToString();
+                if (page.TryGetProperty("next_cursor", out var cursor))
+                    _reportEventCursor = cursor.GetInt64();
+                // The visible tail is bounded; the server retains every event and artifact.
+                if (ReportWorkflowLog.Length > 160000)
+                    ReportWorkflowLog = "（界面仅显示最新日志，完整内容保存在服务端。）\n" + ReportWorkflowLog[^120000..];
+                var hasMore = page.TryGetProperty("has_more", out var more) && more.GetBoolean();
+                if (!hasMore || snapshotEnd is long end && _reportEventCursor >= end) break;
+                if (_reportEventCursor <= previousCursor)
+                    throw new InvalidOperationException("服务端日志游标未前进，已停止续取；完整日志仍保留在服务端。");
+                // Polling catches up in bounded batches; terminal and explicit refresh drain the snapshot.
+                if (++pages >= 4 && !drain) break;
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+        }
+        finally { _chapterLogGate.Release(); }
+    }
+
+    [RelayCommand]
+    private async Task RefreshChapterLogAsync()
+    {
+        if (!_activeReportChapter || _reportAnalysisRunId == 0) return;
+        try
+        {
+            using var cancellation = new CancellationTokenSource(TimeSpan.FromMinutes(1));
+            await LoadChapterEventsAsync(cancellation.Token, reset: true, drain: true);
+        }
+        catch (Exception ex) { ErrorMessage = $"读取章节日志失败：{ex.Message}"; }
+    }
+
+    [RelayCommand]
+    private async Task CancelChapterAnalysisAsync()
+    {
+        if (!_activeReportChapter || _reportAnalysisRunId == 0) return;
+        try { await api.CancelChapterAnalysisAsync(_reportAnalysisRunId, CancellationToken.None); }
+        catch (Exception ex) { ErrorMessage = $"请求取消失败：{ex.Message}"; }
     }
 }
 

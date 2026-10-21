@@ -42,6 +42,8 @@ class StatementTableRow:
     raw_label: str
     row_bbox: tuple[float, float, float, float]
     label_layout: LabelLayout
+    column_bboxes: tuple[tuple[float, float, float, float], ...] = ()
+    value_bboxes: tuple[tuple[float, float, float, float] | None, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -310,16 +312,24 @@ def _statement_table(
     for index, (labels, data) in enumerate(drafts):
         raw_label = _raw_label(labels)
         values = [raw_label.replace("\n", "")]
+        column_data = []
         if notes:
-            values.append("".join(cell.text for cell in data
-                                  if cell.bbox[0] < boundaries[0]).strip())
+            note_data = [cell for cell in data if cell.bbox[0] < boundaries[0]]
+            column_data.append(note_data)
+            values.append("".join(cell.text for cell in note_data).strip())
         for column in range(len(years)):
-            values.append("".join(cell.text for cell in data
-                                  if boundaries[column] <= (cell.bbox[0] + cell.bbox[2]) / 2
-                                  < boundaries[column + 1]).strip())
+            year_data = [cell for cell in data
+                         if boundaries[column] <= (cell.bbox[0] + cell.bbox[2]) / 2
+                         < boundaries[column + 1]]
+            column_data.append(year_data)
+            values.append("".join(cell.text for cell in year_data).strip())
+        label_box = union_bbox(labels)
+        column_bboxes = (label_box, *(union_bbox(labels + cells) for cells in column_data))
+        value_bboxes = (None, *(union_bbox(cells) if cells else None for cells in column_data))
         table_rows.append(StatementTableRow(
             index, tuple(values), raw_label, union_bbox(labels + data),
             _label_layout(labels, page_no, table_name, origin_x, band_centers),
+            tuple(column_bboxes), tuple(value_bboxes),
         ))
         all_cells.extend(labels + data)
     return StatementTable(page_no, table_name, statement_type, tuple(headers), tuple(roles),
@@ -400,6 +410,7 @@ class StatementExtractor:
             title_bottom = title_y + 10
             if match[1] != "合并" or match[2] == "所有者权益变动表":
                 self.statement = self.table_name = None
+                self.last_page = page_no
                 return []
             self.statement, self.table_name = match[2], "合并" + match[2]
         elif self.last_page != page_no - 1 or any(
@@ -489,7 +500,7 @@ class StatementExtractor:
             if not (header_row[0].bbox[1] < row[0].bbox[1] <= header_row[0].bbox[3] + 25):
                 continue
             for cell in row:
-                if ("重述" in cell.text or "重列" in cell.text) and not (
+                if ("重述" in cell.text or "重列" in cell.text) and (
                     left <= (cell.bbox[0] + cell.bbox[2]) / 2 < right
                 ):
                     marker = "重述" if "重述" in cell.text else "重列"

@@ -65,6 +65,13 @@ def _env_ocr_protocol() -> str:
     return value
 
 
+def _env_schema_builder() -> str:
+    value = os.getenv("FINREPORT_LLM_SCHEMA_BUILDER", "native").strip().lower()
+    if value not in {"native", "outlines"}:
+        raise ValueError("FINREPORT_LLM_SCHEMA_BUILDER must be native or outlines")
+    return value
+
+
 class Settings:
     database_url = os.getenv("FINREPORT_DATABASE_URL", "sqlite:///./data/finreport.db")
     storage_dir = Path(os.getenv("FINREPORT_STORAGE_DIR", "./data/storage"))
@@ -79,6 +86,10 @@ class Settings:
     llm_stream = _env_optional_bool("FINREPORT_LLM_STREAM") or False
     llm_provider_sort = os.getenv("FINREPORT_LLM_PROVIDER_SORT", "").strip() or None
     llm_structured_output_mode = _env_structured_output_mode()
+    # Optional integrations are explicit and never trigger additional model calls.
+    llm_schema_builder = _env_schema_builder()
+    output_guard_enabled = _env_bool("FINREPORT_OUTPUT_GUARD_ENABLED", False)
+    semantic_graph_enabled = _env_bool("FINREPORT_SEMANTIC_GRAPH_ENABLED", False)
     # Bound actions, not tokens. Each accepted round is checkpointed for resume.
     analysis_agent_max_rounds = int(os.getenv("FINREPORT_ANALYSIS_AGENT_MAX_ROUNDS", "16"))
     ocr_provider = os.getenv("FINREPORT_OCR_PROVIDER", "baidu-unlimited-ocr")

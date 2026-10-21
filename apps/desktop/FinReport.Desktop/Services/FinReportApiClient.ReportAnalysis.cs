@@ -66,4 +66,4 @@ public sealed record ReportDataContext(long FilingVersionId, string ReportType, 
     JsonElement[] Items, JsonElement Calculations, string[]? Issues, string[]? Limitations);
 
 public sealed record ReportAnalysisStatus(string Status, JsonElement? Output, string? FailureReason,
-    ProviderReasoningView? ProviderReasoning);
+    ProviderReasoningView? ProviderReasoning, JsonElement? SemanticLinkSummary);

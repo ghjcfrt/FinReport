@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime
@@ -79,7 +80,10 @@ from sqlalchemy.orm import Session
 
 from finreport_api.analysis_workflow_routes import router as analysis_workflow_router
 from finreport_api.annual_disclosure_routes import router as annual_disclosure_router
+from finreport_api.auto_validation_routes import router as auto_validation_router
+from finreport_api.chapter_analysis_routes import router as chapter_analysis_router
 from finreport_api.comparison_routes import router as comparison_router
+from finreport_api.grounded_analysis_routes import router as grounded_analysis_router
 from finreport_api.ocr_mapping_routes import router as ocr_mapping_router
 from finreport_api.report_analysis_routes import AnalysisReasoningEnvelope
 from finreport_api.report_analysis_routes import router as report_analysis_router
@@ -90,6 +94,9 @@ app.include_router(ocr_mapping_router)
 app.include_router(annual_disclosure_router)
 app.include_router(analysis_workflow_router)
 app.include_router(report_analysis_router)
+app.include_router(grounded_analysis_router)
+app.include_router(auto_validation_router)
+app.include_router(chapter_analysis_router)
 _recovery_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="extraction-recovery")
 _recovery_stop = Event()
 _recovery_thread: Thread | None = None
@@ -98,6 +105,10 @@ _recovery_thread: Thread | None = None
 @app.on_event("startup")
 def startup() -> None:
     global _recovery_thread
+    journal_logger = logging.getLogger("finreport.run_journal")
+    journal_logger.setLevel(logging.INFO)
+    if not journal_logger.handlers:
+        journal_logger.addHandler(logging.StreamHandler())
     init_database()
     _recover_extractions()
     _recovery_stop.clear()

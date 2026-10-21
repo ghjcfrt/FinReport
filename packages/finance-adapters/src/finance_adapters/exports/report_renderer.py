@@ -228,12 +228,38 @@ def _render_workflow_html(workflow) -> str:
             source = source_map.get(source_id, {})
             references.append(
                 f"<li>来源 {_escape(source_id)}；文件 {_escape(source.get('filing_version_id'))}，"
-                f"第 {_escape(source.get('page_no'))} 页；审核状态 {_escape(source.get('review_status', 'unknown'))}。"
+                f"第 {_escape(source.get('page_no'))} 页；校验状态 {_escape(source.get('review_status', 'unknown'))}。"
                 f"<br>{_escape(source.get('text', '')).replace(chr(10), '<br>')}"
                 f"<br>原文 SHA-256：{_escape(source.get('text_sha256'))}</li>"
             )
         obligation_label = getattr(item, "obligation_id", None)
         obligation_text = f" · 子命题 {_escape(obligation_label)}" if obligation_label else ""
+        semantic_review_label = None
+        has_current_semantic_policy = bool(getattr(workflow, "semantic_policy", None))
+        if (has_current_semantic_policy and item.evidence_kind == "company_disclosure"
+                and obligation_label):
+            for check in workflow.mandatory_checks:
+                if check.topic != item.topic:
+                    continue
+                matching_obligation = next((obligation for obligation in check.obligations
+                                            if obligation.get("id") == obligation_label
+                                            and obligation.get("status") == "needs_review"
+                                            and item.id in obligation.get("finding_ids", [])), None)
+                if matching_obligation is not None:
+                    semantic_review_label = matching_obligation.get("label", obligation_label)
+                    break
+        if semantic_review_label:
+            semantic_review_notice = (
+                f"<p class='meta'>该原文引用是否支持子命题“{_escape(semantic_review_label)}”尚未核验；"
+                "本项仅为待核验候选，不构成该子命题结论。</p>"
+            )
+        elif has_current_semantic_policy and item.evidence_kind == "company_disclosure" and obligation_label:
+            semantic_review_notice = (
+                "<p class='meta'>系统未保存独立的子命题关联核验结果；该原文仅作为候选引用，"
+                "不构成该子命题结论。</p>"
+            )
+        else:
+            semantic_review_notice = ""
         item_assessments = []
         for assessment in getattr(item, "evidence_item_assessments", None) or []:
             value = assessment.model_dump() if hasattr(assessment, "model_dump") else assessment
@@ -246,7 +272,8 @@ def _render_workflow_html(workflow) -> str:
         findings.append(
             f"<div class='claim'><h3>{_escape(topics.get(item.topic, item.topic))}{obligation_text} · "
             f"{_escape(kinds.get(item.evidence_kind, item.evidence_kind))}</h3>"
-            f"<p>{_escape(item.statement)}</p><p>依据与判断边界：{_escape(item.rationale)}</p>"
+            f"<p>{_escape(item.statement)}</p>{semantic_review_notice}"
+            f"<p>依据与判断边界：{_escape(item.rationale)}</p>"
             f"<p class='meta'>判断类别：{_escape(item.assessment)}；"
             f"计算引用：{_escape(item.calculation_ids)}；指标引用：{_escape(item.metric_result_ids)}</p>"
             f"<ul>{''.join(references)}</ul>{item_assessment_html}</div>"
@@ -268,7 +295,7 @@ def _render_workflow_html(workflow) -> str:
         + _render_evidence_coverage_html(getattr(workflow, "evidence_coverage", None))
         + "".join(findings)
         + f"<h3>比较计算与输入依据</h3><ul>{calculations}</ul>"
-        + f"<h3>补充材料与待审核事项</h3><ul>{requirements}</ul>"
+        + f"<h3>补充材料与待校验事项</h3><ul>{requirements}</ul>"
         + f"<p class='meta'>检查点：{_escape(workflow.checkpoint_id)}；材料快照 SHA-256："
         f"{_escape(workflow.document_snapshot_hash)}。仅对已执行检查和已读取证据声明分析范围。</p>"
     )
@@ -324,14 +351,14 @@ def _render_evidence_coverage_html(coverage: dict | None) -> str:
         f"<p>逐项讨论 {_escape(coverage.get('discussed_count', 0))} 项；"
         f"明确证据不足 {_escape(coverage.get('insufficient_evidence_count', 0))} 项；"
         f"语义核验状态：{_escape(coverage.get('semantic_analysis_status', 'requires_semantic_review'))}（仍须复核）。</p>"
-        "<p class='meta'>覆盖率仅度量可观察的原文呈现和逐项处置，不代表模型内部理解或财务人工审核通过。"
+        "<p class='meta'>覆盖率仅度量可观察的原文呈现和逐项处置，不代表模型内部理解或事实已通过正式校验。"
         "逐项原文引用按完整原文行呈现统计；来源页的泛引用不算逐项引用。原单位 unknown 时不得自动换算。</p>"
         "<table><tr><th>原文项目</th><th>原金额</th><th>期间与原列名</th><th>原单位</th>"
-        "<th>已发给模型</th><th>逐项原文引用</th><th>逐项处置</th><th>审核状态与来源</th></tr>"
+        "<th>已发给模型</th><th>逐项原文引用</th><th>逐项处置</th><th>校验状态与来源</th></tr>"
         + "".join(rows) + "</table><h4>清单闭合问题与表内核对</h4><ul>"
         + "".join(issues) + "</ul>"
         f"<p class='meta'>清单 SHA-256：{_escape(coverage.get('manifest_hash'))}；"
-        f"{_escape(coverage.get('boundary', '仅覆盖已取证范围，仍须人工复核。'))}</p></details>"
+        f"{_escape(coverage.get('boundary', '仅覆盖已取证范围，未完成项仍为待校验。'))}</p></details>"
     )
 
 
@@ -374,7 +401,7 @@ def _render_html(
         f"<p>依据：{_escape(text['numeric_rationale'])}</p>"
         f'<p class="meta">口径：{_escape(claim.scope)}；'
         f"结论类型：{_escape(claim.claim_class)}；"
-        f"{'需要人工复核；' if claim.review_required else ''}"
+        f"{'需要进一步校验；' if claim.review_required else ''}"
         f"指标编号：{_escape(', '.join(map(str, claim.metric_result_ids)) or '无')}；"
         f"证据编号：{_escape(', '.join(map(str, claim.evidence_fragment_ids)) or '无')}"
         f"</p></div>"
@@ -382,7 +409,7 @@ def _render_html(
     )
     review_rows = (
         "".join(
-            f'<div class="claim"><h3>待人工复核：观点 {index}</h3>'
+            f'<div class="claim"><h3>待语义校验：观点 {index}</h3>'
             f'<p class="meta">模型定性文字未做语义核验。</p>'
             f"<p>{_escape(text['qualitative_content'])}</p>"
             f"<p>{_escape(text['qualitative_rationale'])}</p></div>"
@@ -426,13 +453,14 @@ def _render_html(
     }
     context_rows = "".join(
         f"<li>{context_label} {_escape(item['id'])}，PDF第{item['page_no']}页，"
-        f"未人审；选项：{_escape(item.get('selected_answer') or item.get('selection_status'))}。"
+        f"上下文校验状态：{_escape(item.get('selection_status') or 'unknown')}；"
+        f"选项：{_escape(item.get('selected_answer') or item.get('selection_status'))}。"
         f"<br>{_escape(item['text']).replace(chr(10), '<br>')}</li>"
         for item in context.get("excerpts", []) if item["id"] in selected_sources
     ) or "<li>本次模型没有引用文字上下文。</li>"
     review_summary = _escape(output.qualitative_summary) or "模型未提供定性总结。"
-    review_mode = ("用户授权的测试豁免：未完成双人独立复核，不构成正式人审通过。"
-                   if test_waiver else "按当前事实审核状态生成；具体审核记录见审计轨迹。")
+    review_mode = ("用户授权的测试豁免：未完成测试金标准评估，不构成正式校验通过。"
+                   if test_waiver else "按当前自动校验状态生成；具体校验记录见审计轨迹。")
     scope = {"consolidated": "合并口径", "parent": "母公司口径"}.get(filing.scope, filing.scope)
     generated = datetime.now(UTC).isoformat()
     workflow_html = _render_workflow_html(output.agent_workflow)
@@ -441,7 +469,7 @@ def _render_html(
 <style>{CSS}</style></head><body>
 <h1>财报分析报告</h1>
 <p><strong>{review_mode}</strong></p>
-<p class="meta">自动核验仅覆盖指标数值、公式与引用。模型定性文字未做语义核验，列于待人工复核区。</p>
+<p class="meta">自动校验仅覆盖指标数值、公式与引用。模型定性文字未做语义核验，列于待语义校验区。</p>
 <p>公司：{_escape(company.name if company else filing.company_id)}；股票代码：{_escape(company.stock_code if company else "未知")}</p>
 <p>报告期间：{filing.period_start.isoformat()} 至 {filing.period_end.isoformat()}；{_escape(scope)}；报告类型：{_escape(filing.report_type)}</p>
 <p class="meta">披露版本：{filing.id}；分析运行：{analysis.id}；生成时间（UTC）：{generated}</p>
@@ -453,14 +481,14 @@ def _render_html(
 {workflow_html}
 <h2>异常观察</h2><ul>{anomaly_rows}</ul>
 <h2>证据索引</h2><ul class="evidence">{evidence_rows}</ul>
-<h2>模型定性观点：待人工复核</h2>
+<h2>模型定性观点：待语义校验</h2>
 <p class="meta">模型自由总结未做语义核验，未作为报告总体结论输出；定性观点可能与指标矛盾。</p>
 <h3>模型定性总结</h3><p>{review_summary}</p>
 {review_rows}
 <h2>过程透明与复现</h2>
 <p>输入快照 SHA-256：{_escape(analysis.input_snapshot_hash)}<br>工具轨迹 SHA-256：{_escape(analysis.tool_trace_hash)}</p>
 <p>程序扫描页数：{_escape(context.get('total_pages', '不可用'))}；实际模型摘录页码：{_escape(context.get('selected_page_numbers', []))}；摘录行数：{_escape(context.get('model_input_line_count', 0))}。只对实际摘录声明模型输入覆盖。</p>
-<p>候选摘录：{_escape(context.get('candidate_excerpt_count', 0))}；因预算省略：{_escape(context.get('omitted_excerpt_count', 0))}；不完整问项：{_escape(context.get('incomplete_question_count', 0))}。不完整问项禁止支撑独立定性断言；跨页问项仍需人工核对。</p>
+<p>候选摘录：{_escape(context.get('candidate_excerpt_count', 0))}；因预算省略：{_escape(context.get('omitted_excerpt_count', 0))}；不完整问项：{_escape(context.get('incomplete_question_count', 0))}。不完整问项禁止支撑独立定性断言；跨页问项仍需补充证据校验。</p>
 <p class="meta">省略原因：{_escape(context.get('omission_reasons', {}))}</p>
 <table><tr><th>调用</th><th>供应商响应ID</th><th>校验结果</th><th>耗时秒</th><th>总tokens</th><th>思考字段</th></tr>{execution_rows}</table>
 {reasoning_html}
@@ -500,7 +528,7 @@ def _write_pdf(page: str, target: Path) -> None:
         for index, pdf_page in enumerate(document):
             pdf_page.insert_text(
                 (36, 20),
-                "定性内容待人工复核；自动核验仅覆盖指标、公式及引用。",
+                "定性内容待语义校验；自动校验仅覆盖指标、公式及引用。",
                 fontname="ReportReview" if font else "china-s",
                 fontfile=str(font) if font else None,
                 fontsize=7.5,

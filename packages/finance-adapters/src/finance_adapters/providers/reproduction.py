@@ -19,6 +19,22 @@ SOURCE_FILES = (
     "packages/finance-adapters/src/finance_adapters/providers/evidence_retrieval.py",
     "packages/finance-adapters/src/finance_adapters/providers/evidence_completeness.py",
     "packages/finance-adapters/src/finance_adapters/providers/model_clients.py",
+    "packages/finance-adapters/src/finance_adapters/providers/output_guard.py",
+    "packages/finance-adapters/src/finance_adapters/providers/semantic_graph.py",
+    "packages/finance-adapters/src/finance_adapters/providers/analysis_evaluation.py",
+    "packages/finance-adapters/src/finance_adapters/providers/financial_semantics.py",
+    "packages/finance-adapters/src/finance_adapters/providers/grounded_analysis.py",
+    "packages/finance-adapters/src/finance_adapters/providers/disclosed_relations.py",
+    "packages/finance-adapters/src/finance_adapters/providers/disclosure_facets.py",
+    "packages/finance-adapters/src/finance_adapters/providers/task_evidence_contract.py",
+    "packages/finance-adapters/src/finance_adapters/providers/grounded_recovery.py",
+    "packages/finance-adapters/src/finance_adapters/providers/grounded_presentation.py",
+    "packages/finance-adapters/src/finance_adapters/providers/disclosed_arithmetic.py",
+    "packages/finance-adapters/src/finance_adapters/providers/grounded_generation.py",
+    "packages/finance-adapters/src/finance_adapters/providers/grounded_source_read.py",
+    "packages/finance-adapters/src/finance_adapters/providers/agent_prompt_registry.py",
+    "packages/finance-adapters/src/finance_adapters/providers/evidence_context.py",
+    "apps/api-host/src/finreport_api/grounded_analysis_routes.py",
     "packages/finance-adapters/src/finance_adapters/providers/document_context.py",
     "packages/finance-adapters/src/finance_adapters/providers/reproduction.py",
     "packages/finance-adapters/src/finance_adapters/persistence/metric_gateway.py",
@@ -40,7 +56,8 @@ SOURCE_FILES = (
     "packages/finance-adapters/src/finance_adapters/parsing/pdf_parser.py",
     "packages/finance-adapters/src/finance_adapters/parsing/comparative.py",
     "packages/finance-adapters/src/finance_adapters/parsing/statement_extractor.py",
-    "tools/replay-analysis.py", "pyproject.toml", "uv.lock",
+    "tools/replay-analysis.py", "tools/replay-grounded-analysis.py",
+    "tools/inspect-grounded-evidence.py", "pyproject.toml", "uv.lock",
 )
 STAGES = ("structure", "reference", "numeric", "semantic")
 REFERENCE_FORMULA_VERSION = "general-non-financial-v4"
@@ -81,7 +98,8 @@ def runtime_manifest() -> dict:
     except (OSError, subprocess.SubprocessError):
         revision, dirty = None, None
     dependencies = {}
-    for name in ("pydantic", "SQLAlchemy", "httpx", "PyMuPDF", "fastapi"):
+    for name in ("pydantic", "SQLAlchemy", "httpx", "PyMuPDF", "fastapi",
+                 "guardrails-ai", "outlines", "semantica", "dspy"):
         try:
             dependencies[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
@@ -244,16 +262,22 @@ def _reference_results(package: dict) -> list[dict]:
     return results
 
 
-def _validate_raw(raw_content: str, package: dict) -> tuple[dict | None, dict, str | None, list[dict]]:
+def _validate_raw(raw_content: str, package: dict, *,
+                  final_semantic_policy: str | None = None) -> tuple[dict | None, dict, str | None, list[dict]]:
     from finance_domain.analysis.contracts import AnalysisOutput
     from pydantic import ValidationError
 
-    from finance_adapters.providers.llm_analysis import AnalysisValidationError, _validate_claims
+    from finance_adapters.providers.llm_analysis import (
+        AnalysisValidationError,
+        _validate_claims,
+        _validate_final_semantics,
+    )
 
     output, structured, issues, error = None, True, [], None
     try:
         output = AnalysisOutput.model_validate_json(raw_content)
         _validate_claims(output, package)
+        _validate_final_semantics(output, package, final_semantic_policy=final_semantic_policy)
     except ValidationError as exc:
         structured, error = False, str(exc)
         issues = [{"stage": "structure", "code": item["type"],
@@ -527,7 +551,9 @@ def _replay_attempts(trace: dict, package: dict) -> tuple[list[dict], dict | Non
 
     replay_evidence_workflow(trace, package, _check_provider_metadata)
     workflow = trace.get("agent_workflow")
-    expected_request, results, accepted_output = _analysis_request(package, workflow), [], None
+    policy = trace.get("final_semantic_policy")
+    expected_request, results, accepted_output = _analysis_request(
+        package, workflow, final_semantic_policy=policy), [], None
     attempts = trace["attempts"]
     if not 1 <= len(attempts) <= 2 or trace.get("system_prompt") != SYSTEM_PROMPT:
         raise ValueError("REPLAY_ATTEMPT_SEQUENCE_OR_SYSTEM_PROMPT_MISMATCH")
@@ -559,7 +585,7 @@ def _replay_attempts(trace: dict, package: dict) -> tuple[list[dict], dict | Non
             results.append({"attempt": index + 1, "status": status, "validation": expected_stages,
                             "provider_failure_reexecuted": False, "provider_metadata": provider})
             continue
-        model_output, stages, error, issues = _validate_raw(raw, package)
+        model_output, stages, error, issues = _validate_raw(raw, package, final_semantic_policy=policy)
         if attempt.get("validation") != stages or (model_output is not None and attempt.get("model_output") != model_output):
             raise ValueError("REPLAY_ATTEMPT_VALIDATION_MISMATCH")
         if error is not None:
@@ -572,7 +598,8 @@ def _replay_attempts(trace: dict, package: dict) -> tuple[list[dict], dict | Non
         else:
             if status not in {"accepted", "render_rejected"} or index != len(attempts) - 1:
                 raise ValueError("REPLAY_ACCEPTANCE_CLASSIFICATION_MISMATCH")
-            rendered = finalize_analysis_output(AnalysisOutput.model_validate(model_output), package, workflow).model_dump(mode="json")
+            rendered = finalize_analysis_output(AnalysisOutput.model_validate(model_output), package, workflow,
+                                                final_semantic_policy=policy).model_dump(mode="json")
             if attempt.get("rendered_output") != rendered:
                 raise ValueError("REPLAY_RENDERED_OUTPUT_MISMATCH")
             transition = attempt.get("provider_to_render", {})
@@ -583,7 +610,7 @@ def _replay_attempts(trace: dict, package: dict) -> tuple[list[dict], dict | Non
                 raise ValueError("REPLAY_RENDER_TRANSITION_MISMATCH")
             render_error = None
             try:
-                validate_analysis_output(rendered, package)
+                validate_analysis_output(rendered, package, final_semantic_policy=policy)
             except ValueError as exc:
                 render_error = str(exc)
             expected_render = {"status": "passed"} if render_error is None else {"status": "failed", "error": render_error}
@@ -670,7 +697,7 @@ def replay_bundle(bundle: dict, source_pdf: Path | None = None) -> dict:
             raise ValueError("REPLAY_ACCEPTED_MODEL_RESPONSE_REQUIRED")
         if replayed != payload["output"] or trace.get("output_hash") != stable_hash(replayed):
             raise ValueError("REPLAY_RENDERED_OUTPUT_MISMATCH")
-        validate_analysis_output(payload["output"], package)
+        validate_analysis_output(payload["output"], package, final_semantic_policy=trace.get("final_semantic_policy"))
         workflow = trace.get("agent_workflow")
         if workflow is not None and workflow.get("status") != analysis_status:
             raise ValueError("REPLAY_WORKFLOW_STATUS_MISMATCH")
